@@ -93,7 +93,7 @@ na interface, e o caminho manual continua disponível.
 
 ---
 
-## O que existe nesta etapa
+## Implementado
 
 ### Barra lateral
 `Início` e `Blocos` funcionais. `Calendário` e `Desempenho` aparecem desabilitados, com tooltip
@@ -120,9 +120,14 @@ de faltas e média para aprovação. Esses valores são apenas armazenados nesta
 
 ### Janela do bloco
 Cabeçalho com o nome e o alternador de três modos — **Modo Prova**, **Modo Projeto**,
-**Modo Aprendizagem**. Os modos são lentes sobre o mesmo bloco, não etapas: nenhum é bloqueado por
-falta de progresso em outro. Prova e Projeto exibem apenas um placeholder.
-Aprendizagem é o modo padrão e está completo.
+**Modo Aprendizagem**. Os três estão implementados. Os modos são lentes sobre o mesmo bloco, não
+etapas: nenhum é bloqueado por falta de progresso em outro. Aprendizagem é o modo padrão ao abrir.
+
+À direita fica o **chat lateral do bloco**, recolhível e presente nos três modos. A conversa é
+única por bloco, persistida em `mensagens_chat` (com `topico_id` nulo, o que a separa das conversas
+de sondagem). O único contexto enviado ao modelo, além do histórico, é o rótulo do modo ativo —
+cada mensagem guarda o modo em que foi escrita. Erros da IA aparecem na conversa sem bloquear a
+tela, e a mensagem do usuário permanece salva.
 
 A engrenagem abre as configurações, com duas abas:
 
@@ -190,6 +195,72 @@ deste bloco?", com um botão que abre o editor. Esse aviso existe só neste modo
 A IA nunca marca o check, nunca sugere marcar e nunca emite veredito, nota, porcentagem ou
 "aprovado/reprovado".
 
+### Modo Prova
+Cada tópico do bloco é um cartão expansível com o título, a tag de peso e a contagem de listas por
+status. Expandir mostra as listas daquele tópico; clicar numa lista abre o visualizador.
+
+Dois botões por tópico:
+
+**"Criar lista de questões"** — modal com três fontes de peso visual igual, mais o campo de
+quantidade de questões:
+
+1. **Usar documentos já enviados** — checkboxes com os registros de `documentos_fonte` do bloco.
+   Fica desabilitado, com explicação, quando o bloco ainda não tem documentos.
+2. **Enviar novos documentos** — upload de `.txt`, `.md` ou `.pdf`. O texto é extraído e também
+   guardado em `documentos_fonte`, ficando disponível para as próximas listas.
+3. **Buscar na internet** — exige confirmação explícita: o botão só libera depois de marcar a
+   caixa ao lado do aviso *"Questões da internet podem não refletir o estilo de cobrança da sua
+   disciplina."*
+
+A lista é gravada em `listas_questoes` com a origem correta (`gerada_fontes` ou `gerada_internet`).
+
+**"Enviar lista"** — upload de arquivo ou colagem de texto, com o checkbox *"Esta lista já vem com
+gabarito"*. Marcado, você informa o gabarito; desmarcado, a IA resolve as questões e o gabarito é
+salvo junto. Se a geração do gabarito falhar, a lista é salva do mesmo jeito. Origem `enviada`.
+
+#### Visualizador de lista
+Usado tanto no Modo Prova quanto nos testes teóricos do Modo Projeto.
+
+- Questões em área de leitura confortável.
+- Gabarito em seção separada e **recolhida por padrão**, atrás de "Mostrar gabarito".
+- Seletor de status sempre visível: **Não feita / Incompleta / Completa**, marcado apenas pelo
+  usuário — a IA nunca altera esse status.
+- Tag de origem visível (Enviada / Gerada de documentos / Gerada da internet).
+- **"Corrigir com a IA"** injeta o contexto da lista no chat lateral como uma mensagem visível, onde
+  você cola suas respostas e recebe a correção na conversa. A correção é informativa e **não altera
+  o status** da lista.
+- Marcar uma lista como **Completa** insere uma evidência em `evidencias` (modo `prova`, descrição
+  "Lista ⟨título⟩ concluída"). Só na transição, para não duplicar.
+
+### Modo Projeto
+Duas seções na mesma tela.
+
+#### Entregáveis
+- Barra de progresso com **contagem pura**: "3 de 7 entregáveis concluídos". Nunca percentual de
+  domínio, nota ou nível.
+- Cada entregável mostra nome, descrição, data de entrega, tempo estimado, ferramentas e as tags dos
+  tópicos associados.
+- Checkbox de conclusão, marcado manualmente pelo usuário.
+- **"Reagendar"** nos que têm data — apenas move a data, nunca conta como atraso.
+- **"Novo entregável"** — modal com nome, descrição, tópicos associados (multi-seleção sobre a
+  árvore de tópicos), ferramentas, tempo estimado em horas e data de entrega. As associações vão
+  para `entregavel_topicos`.
+- **"Sugerir entregáveis"** — campo para descrever a expectativa do projeto. As sugestões aparecem
+  como **cartões de proposta**, com "Adicionar" e "Descartar". Nada é gravado sem ação explícita.
+- Concluir um entregável insere uma evidência para **cada** tópico associado (modo `projeto`,
+  descrição "Entregável ⟨nome⟩ concluído").
+
+#### Testes teóricos
+Ficam nesta mesma tela — nunca redirecionam para o Modo Prova.
+
+- **"Pedir teste de um tópico"** abre o mesmo fluxo de três fontes do Modo Prova.
+- Toggle **"Sugerir testes automaticamente"**: ligado, concluir um entregável gera testes para os
+  tópicos associados. O **limite rígido de 3 testes por vez** está escrito ao lado do toggle;
+  havendo mais tópicos, os de maior peso têm prioridade. Usa os documentos-fonte do bloco — sem
+  documentos, o entregável é concluído normalmente e a interface explica por que não houve geração.
+- Os testes aparecem aqui com o mesmo visualizador do Modo Prova (gabarito recolhido + seletor de
+  status) e não se misturam com as listas do Modo Prova.
+
 ---
 
 ## Princípios de design
@@ -212,11 +283,15 @@ Estes princípios estão refletidos no código e devem ser preservados em etapas
 
 ## Banco de dados
 
-Tabelas em uso nesta etapa: `pastas`, `blocos`, `bloco_relacoes`, `topicos`, `revisoes`,
-`evidencias`, `mensagens_chat`, `documentos_fonte`.
+Tabelas em uso: `pastas`, `blocos`, `bloco_relacoes`, `topicos`, `revisoes`, `evidencias`,
+`mensagens_chat`, `documentos_fonte`, `listas_questoes`, `entregaveis`, `entregavel_topicos`.
 
-Já criadas no schema, sem telas ainda (para não exigir migration futura): `listas_questoes`,
-`entregaveis`, `entregavel_topicos`, `eventos`, `avaliacoes`.
+Já criadas no schema, sem telas ainda (para não exigir migration futura): `eventos` e `avaliacoes`.
+
+As colunas acrescentadas depois da primeira versão (gabarito e contexto das listas, ferramentas,
+tempo estimado e conclusão dos entregáveis, preferência de testes automáticos do bloco) entram por
+uma migration idempotente em `migrar()`, já que `CREATE TABLE IF NOT EXISTS` não altera tabelas
+existentes.
 
 O schema completo está em [`server/db.js`](server/db.js).
 
@@ -242,6 +317,16 @@ O schema completo está em [`server/db.js`](server/db.js).
 | GET/POST | `/api/blocos/:id/documentos` | Documentos-fonte |
 | POST | `/api/ia/extrair-tabela`, `/api/ia/roteiro` | Geração da árvore pela IA |
 | GET/POST | `/api/sondagem/...` | Histórico, abertura e mensagens da sondagem |
+| GET/POST/DELETE | `/api/blocos/:id/chat` | Chat lateral do bloco |
+| GET/POST | `/api/blocos/:id/listas` | Listas do bloco por contexto (`prova` ou `projeto`) |
+| GET/PATCH/DELETE | `/api/listas/:id` | Abrir, mudar status ou título, excluir |
+| POST | `/api/listas/:id/corrigir` | Leva o contexto da lista para o chat do bloco |
+| POST | `/api/ia/lista-questoes`, `/api/ia/gabarito` | Geração de questões e de gabarito |
+| GET/POST | `/api/blocos/:id/entregaveis` | Entregáveis do bloco |
+| PATCH/DELETE | `/api/entregaveis/:id` | Editar (inclusive as associações) ou excluir |
+| POST | `/api/entregaveis/:id/concluir` | Conclui, registra evidências e pode gerar testes |
+| POST | `/api/entregaveis/:id/reagendar` | Move a data de entrega |
+| POST | `/api/ia/sugerir-entregaveis` | Propostas de entregáveis (nada é salvo) |
 | GET | `/api/inicio` | Blocos recentes e revisões pendentes hoje |
 
 ---
@@ -250,8 +335,6 @@ O schema completo está em [`server/db.js`](server/db.js).
 
 Ficou fora desta etapa:
 
-- **Modo Prova** — hoje apenas um placeholder.
-- **Modo Projeto** — hoje apenas um placeholder.
 - **Cronograma dinâmico** — o Início traz só a lista simples de revisões pendentes hoje.
 - **Página de Calendário** — entrada desabilitada na barra lateral; a tabela `eventos` já existe.
 - **Página de Desempenho** — entrada desabilitada na barra lateral; a tabela `avaliacoes` já existe.
@@ -259,5 +342,7 @@ Ficou fora desta etapa:
   visualização em grafo.
 - **Ferramentas acadêmicas** — controle de faltas e de médias. Os campos `limite_faltas`,
   `faltas_registradas` e `media_aprovacao` já são armazenados, mas não têm tela de uso.
-- **Listas de questões e entregáveis** — tabelas `listas_questoes`, `entregaveis` e
-  `entregavel_topicos` criadas, sem interface.
+- **Busca na internet com uma chave real** — a geração usa a ferramenta de busca do Gemini
+  (`google_search`). O caminho foi exercitado até a resposta da API, mas o resultado com busca
+  ativa só pode ser conferido com uma `GEMINI_API_KEY` válida.
+- **Anexar respostas por arquivo na correção** — hoje as respostas são coladas no chat.

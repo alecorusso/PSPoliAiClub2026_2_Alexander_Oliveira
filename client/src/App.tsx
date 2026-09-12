@@ -72,7 +72,10 @@ function BarraLateral() {
     );
 
   return (
-    <aside className="flex w-56 shrink-0 flex-col border-r border-zinc-200 bg-zinc-100/60 px-3 py-4 dark:border-zinc-800 dark:bg-zinc-900/60">
+    <aside
+      aria-label="Navegação principal"
+      className="flex w-56 shrink-0 flex-col border-r border-zinc-200 bg-zinc-100/60 px-3 py-4 dark:border-zinc-800 dark:bg-zinc-900/60"
+    >
       <div className="mb-5 px-2">
         <p className="text-sm font-semibold">Plataforma de Estudos</p>
         <p className="text-xs text-zinc-500 dark:text-zinc-500">Registra e organiza</p>

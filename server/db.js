@@ -148,8 +148,40 @@ CREATE INDEX IF NOT EXISTS idx_evidencias_topico ON evidencias(topico_id);
 CREATE INDEX IF NOT EXISTS idx_mensagens_bloco ON mensagens_chat(bloco_id, topico_id);
 `;
 
+// Colunas acrescentadas depois da primeira versao do schema. Como
+// CREATE TABLE IF NOT EXISTS nao altera tabelas ja existentes, cada coluna e
+// adicionada aqui de forma idempotente.
+const COLUNAS_NOVAS = [
+  // Modo Prova
+  ['listas_questoes', 'gabarito', 'TEXT NULL'],
+  ['listas_questoes', 'quantidade', 'INTEGER NULL'],
+  // 'prova' para listas do Modo Prova, 'projeto' para os testes teoricos
+  ['listas_questoes', 'contexto', "TEXT DEFAULT 'prova'"],
+  // Modo Projeto
+  ['entregaveis', 'ferramentas', 'TEXT NULL'],
+  ['entregaveis', 'tempo_estimado_horas', 'REAL NULL'],
+  ['entregaveis', 'concluido', 'INTEGER DEFAULT 0'],
+  ['entregaveis', 'concluido_em', 'TEXT NULL'],
+  // Preferencia por bloco: gerar testes teoricos ao concluir um entregavel
+  ['blocos', 'sugerir_testes_auto', 'INTEGER DEFAULT 0'],
+];
+
+function garantirColuna(tabela, coluna, definicao) {
+  const existentes = db.prepare(`PRAGMA table_info(${tabela})`).all();
+  if (existentes.some((c) => c.name === coluna)) return;
+  db.exec(`ALTER TABLE ${tabela} ADD COLUMN ${coluna} ${definicao}`);
+}
+
 export function migrar() {
   db.exec(SCHEMA);
+  for (const [tabela, coluna, definicao] of COLUNAS_NOVAS) {
+    garantirColuna(tabela, coluna, definicao);
+  }
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_listas_bloco ON listas_questoes(bloco_id, contexto);
+    CREATE INDEX IF NOT EXISTS idx_entregaveis_bloco ON entregaveis(bloco_id);
+    CREATE INDEX IF NOT EXISTS idx_entregavel_topicos ON entregavel_topicos(entregavel_id);
+  `);
 }
 
 export const agora = () => new Date().toISOString();

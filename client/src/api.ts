@@ -1,12 +1,22 @@
 import type {
   Bloco,
+  ContextoLista,
   DocumentoFonte,
+  Entregavel,
   Evidencia,
+  ListaQuestoes,
   Mensagem,
+  Modo,
+  OrigemLista,
   Pasta,
+  Questao,
   Relacao,
   RespostaArvore,
+  RespostaGabarito,
+  RespostaLista,
   Revisao,
+  StatusLista,
+  SugestaoEntregavel,
   TipoRelacao,
   Topico,
 } from './tipos';
@@ -110,4 +120,73 @@ export const api = {
     get<{ blocos_recentes: (Bloco & { pasta_nome: string | null })[]; revisoes_hoje: Revisao[]; hoje: string }>(
       '/inicio'
     ),
+};
+
+// ---------------------------------------------------------------------------
+// Chat lateral do bloco (mensagens com topico_id nulo)
+// ---------------------------------------------------------------------------
+export const apiChat = {
+  historico: (blocoId: string) => get<Mensagem[]>(`/blocos/${blocoId}/chat`),
+  enviar: (blocoId: string, conteudo: string, modo: Modo) =>
+    post<{ mensagens: Mensagem[]; erro: string | null }>(`/blocos/${blocoId}/chat`, { conteudo, modo }),
+  limpar: (blocoId: string) => remover(`/blocos/${blocoId}/chat`),
+};
+
+// ---------------------------------------------------------------------------
+// Listas de questões (Modo Prova e testes teóricos do Modo Projeto)
+// ---------------------------------------------------------------------------
+export const apiListas = {
+  listar: (blocoId: string, contexto: ContextoLista) =>
+    get<ListaQuestoes[]>(`/blocos/${blocoId}/listas?contexto=${contexto}`),
+  obter: (id: string) => get<ListaQuestoes>(`/listas/${id}`),
+  criar: (
+    blocoId: string,
+    dados: {
+      topico_id: string | null;
+      titulo: string;
+      questoes: Questao[] | string;
+      gabarito?: RespostaGabarito[] | string | null;
+      origem: OrigemLista;
+      quantidade?: number | null;
+      contexto: ContextoLista;
+    }
+  ) => post<ListaQuestoes>(`/blocos/${blocoId}/listas`, dados),
+  atualizar: (id: string, dados: { status?: StatusLista; titulo?: string; gabarito?: RespostaGabarito[] | string | null }) =>
+    patch<ListaQuestoes>(`/listas/${id}`, dados),
+  excluir: (id: string) => remover(`/listas/${id}`),
+  /** Injeta o contexto da lista no chat do bloco. Nunca altera o status. */
+  corrigir: (id: string) => post<{ mensagens: Mensagem[]; erro: string | null }>(`/listas/${id}/corrigir`),
+
+  gerar: (dados: {
+    bloco_id: string;
+    topico_id: string;
+    quantidade: number;
+    fonte: { tipo: 'documentos' | 'internet'; documentos_ids?: string[] };
+  }) => post<RespostaLista>('/ia/lista-questoes', dados),
+  gerarGabarito: (questoes: Questao[] | string) =>
+    post<{ gabarito: RespostaGabarito[]; erro: string | null }>('/ia/gabarito', { questoes }),
+};
+
+// ---------------------------------------------------------------------------
+// Entregáveis (Modo Projeto)
+// ---------------------------------------------------------------------------
+export const apiEntregaveis = {
+  listar: (blocoId: string) => get<Entregavel[]>(`/blocos/${blocoId}/entregaveis`),
+  criar: (blocoId: string, dados: Record<string, unknown>) =>
+    post<Entregavel>(`/blocos/${blocoId}/entregaveis`, dados),
+  atualizar: (id: string, dados: Record<string, unknown>) => patch<Entregavel>(`/entregaveis/${id}`, dados),
+  excluir: (id: string) => remover(`/entregaveis/${id}`),
+  /** Ao concluir, registra evidência por tópico e pode gerar testes teóricos. */
+  concluir: (id: string, concluido: boolean) =>
+    post<{ ok: true; testes_gerados: ListaQuestoes[]; erro: string | null }>(`/entregaveis/${id}/concluir`, {
+      concluido,
+    }),
+  /** Apenas move a data. Nunca conta como atraso. */
+  reagendar: (id: string, data: string) =>
+    post<{ ok: true }>(`/entregaveis/${id}/reagendar`, { data_entrega: data }),
+  sugerir: (blocoId: string, descricao: string) =>
+    post<{ entregaveis: SugestaoEntregavel[]; erro: string | null }>('/ia/sugerir-entregaveis', {
+      bloco_id: blocoId,
+      descricao,
+    }),
 };

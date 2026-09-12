@@ -13,8 +13,12 @@ const { db, migrar, agora, hojeISO, somarDias, novoId } = await import('./db.js'
 // Importado depois do dotenv: gemini.js le process.env no carregamento do modulo.
 const {
   conversarSondagem,
+  conversarBloco,
   extrairTabelaConteudos,
   buscarRoteiroEstudos,
+  gerarListaQuestoes,
+  gerarGabarito,
+  sugerirEntregaveis,
   iaDisponivel,
   PROTOCOLOS,
 } = await import('./gemini.js');
@@ -36,6 +40,9 @@ const rota = (fn) => (req, res) => {
 };
 
 const bool = (v) => (v ? 1 : 0);
+
+// Os tres modos sao lentes sobre o mesmo bloco, nunca etapas sequenciais.
+const MODOS = new Set(['prova', 'projeto', 'aprendizagem']);
 
 // ===========================================================================
 // Status
@@ -168,7 +175,7 @@ app.patch(
     db.prepare(
       `UPDATE blocos SET nome = ?, descricao = ?, pasta_id = ?, favorito = ?, oculto = ?,
         wrapper_academico = ?, limite_faltas = ?, faltas_registradas = ?, media_aprovacao = ?,
-        tabela_conteudos_construida = ? WHERE id = ?`
+        tabela_conteudos_construida = ?, sugerir_testes_auto = ? WHERE id = ?`
     ).run(
       b.nome?.trim() || atual.nome,
       b.descricao === undefined ? atual.descricao : b.descricao?.trim() || null,
@@ -182,6 +189,7 @@ app.patch(
       b.tabela_conteudos_construida === undefined
         ? atual.tabela_conteudos_construida
         : bool(b.tabela_conteudos_construida),
+      b.sugerir_testes_auto === undefined ? atual.sugerir_testes_auto : bool(b.sugerir_testes_auto),
       atual.id
     );
     res.json(db.prepare('SELECT * FROM blocos WHERE id = ?').get(atual.id));
@@ -546,11 +554,11 @@ function historicoSondagem(blocoId, topicoId) {
     .all(blocoId, topicoId ?? null);
 }
 
-function salvarMensagem(blocoId, topicoId, papel, conteudo) {
+function salvarMensagem(blocoId, topicoId, papel, conteudo, modo = 'aprendizagem') {
   const id = novoId();
   db.prepare(
     'INSERT INTO mensagens_chat (id, bloco_id, topico_id, papel, conteudo, modo_ativo, criado_em) VALUES (?,?,?,?,?,?,?)'
-  ).run(id, blocoId, topicoId ?? null, papel, conteudo, 'aprendizagem', agora());
+  ).run(id, blocoId, topicoId ?? null, papel, conteudo, MODOS.has(modo) ? modo : 'aprendizagem', agora());
   return db.prepare('SELECT * FROM mensagens_chat WHERE id = ?').get(id);
 }
 
@@ -640,6 +648,457 @@ app.get(
       .all(hojeISO());
 
     res.json({ blocos_recentes: recentes, revisoes_hoje: revisoes, hoje: hojeISO() });
+  })
+);
+
+// ===========================================================================
+// CHAT LATERAL DO BLOCO
+// As mensagens do chat do bloco sao as que tem topico_id NULL; as da sondagem
+// ficam sob o id do topico. Ambas moram em mensagens_chat.
+// ===========================================================================
+app.get(
+  '/api/blocos/:id/chat',
+  rota((req, res) => {
+    res.json(historicoSondagem(req.params.id, null));
+  })
+);
+
+app.post(
+  '/api/blocos/:id/chat',
+  rota(async (req, res) => {
+    const blocoId = req.params.id;
+    const modo = MODOS.has(req.body?.modo) ? req.body.modo : 'aprendizagem';
+    const conteudo = String(req.body?.conteudo ?? '').trim();
+    if (!conteudo) return res.status(400).json({ erro: 'Mensagem vazia.' });
+
+    const minha = salvarMensagem(blocoId, null, 'usuario', conteudo, modo);
+    try {
+      const texto = await conversarBloco(historicoSondagem(blocoId, null), modo);
+      return res.json({ mensagens: [minha, salvarMensagem(blocoId, null, 'assistente', texto, modo)], erro: null });
+    } catch (e) {
+      // A mensagem do usuario permanece salva; o erro nunca bloqueia a tela.
+      return res.json({ mensagens: [minha], erro: `A IA não respondeu (${e.message}).` });
+    }
+  })
+);
+
+app.delete(
+  '/api/blocos/:id/chat',
+  rota((req, res) => {
+    db.prepare('DELETE FROM mensagens_chat WHERE bloco_id = ? AND topico_id IS NULL').run(req.params.id);
+    res.json({ ok: true });
+  })
+);
+
+// ===========================================================================
+// LISTAS DE QUESTOES
+// ===========================================================================
+const ORIGENS = new Set(['enviada', 'gerada_fontes', 'gerada_internet']);
+const STATUS_LISTA = new Set(['nao_feita', 'incompleta', 'completa']);
+
+const SQL_LISTAS = `
+  SELECT l.*, t.titulo AS topico_titulo, t.peso AS topico_peso
+    FROM listas_questoes l
+    LEFT JOIN topicos t ON t.id = l.topico_id`;
+
+app.get(
+  '/api/blocos/:id/listas',
+  rota((req, res) => {
+    const contexto = req.query.contexto === 'projeto' ? 'projeto' : 'prova';
+    res.json(
+      db
+        .prepare(`${SQL_LISTAS} WHERE l.bloco_id = ? AND l.contexto = ? ORDER BY l.criado_em DESC`)
+        .all(req.params.id, contexto)
+    );
+  })
+);
+
+app.get(
+  '/api/listas/:id',
+  rota((req, res) => {
+    const lista = db.prepare(`${SQL_LISTAS} WHERE l.id = ?`).get(req.params.id);
+    if (!lista) return res.status(404).json({ erro: 'Lista não encontrada.' });
+    res.json(lista);
+  })
+);
+
+app.post(
+  '/api/blocos/:id/listas',
+  rota((req, res) => {
+    const b = req.body ?? {};
+    if (!ORIGENS.has(b.origem)) return res.status(400).json({ erro: 'Origem inválida.' });
+    const id = novoId();
+    db.prepare(
+      `INSERT INTO listas_questoes
+        (id, bloco_id, topico_id, titulo, enunciado, gabarito, origem, status, quantidade, contexto, criado_em)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?)`
+    ).run(
+      id,
+      req.params.id,
+      b.topico_id || null,
+      String(b.titulo || 'Lista sem título').trim(),
+      // questoes e gabarito sao guardados como JSON quando estruturados,
+      // ou como texto simples quando a lista foi colada/enviada pelo usuario.
+      typeof b.questoes === 'string' ? b.questoes : JSON.stringify(b.questoes ?? []),
+      b.gabarito == null ? null : typeof b.gabarito === 'string' ? b.gabarito : JSON.stringify(b.gabarito),
+      b.origem,
+      'nao_feita',
+      b.quantidade == null ? null : Number(b.quantidade),
+      b.contexto === 'projeto' ? 'projeto' : 'prova',
+      agora()
+    );
+    res.status(201).json(db.prepare(`${SQL_LISTAS} WHERE l.id = ?`).get(id));
+  })
+);
+
+app.patch(
+  '/api/listas/:id',
+  rota((req, res) => {
+    const atual = db.prepare('SELECT * FROM listas_questoes WHERE id = ?').get(req.params.id);
+    if (!atual) return res.status(404).json({ erro: 'Lista não encontrada.' });
+
+    const b = req.body ?? {};
+    const status = STATUS_LISTA.has(b.status) ? b.status : atual.status;
+
+    db.prepare('UPDATE listas_questoes SET titulo = ?, status = ?, gabarito = ? WHERE id = ?').run(
+      b.titulo?.trim() || atual.titulo,
+      status,
+      b.gabarito === undefined
+        ? atual.gabarito
+        : b.gabarito == null
+          ? null
+          : typeof b.gabarito === 'string'
+            ? b.gabarito
+            : JSON.stringify(b.gabarito),
+      atual.id
+    );
+
+    // Marcar como "completa" registra uma evidencia — log qualitativo, nunca somado.
+    // So no momento da transicao, para nao duplicar.
+    if (status === 'completa' && atual.status !== 'completa' && atual.topico_id) {
+      db.prepare('INSERT INTO evidencias (id, topico_id, modo, descricao, data) VALUES (?,?,?,?,?)').run(
+        novoId(),
+        atual.topico_id,
+        atual.contexto === 'projeto' ? 'projeto' : 'prova',
+        `Lista ${b.titulo?.trim() || atual.titulo} concluída`,
+        agora()
+      );
+    }
+
+    res.json(db.prepare(`${SQL_LISTAS} WHERE l.id = ?`).get(atual.id));
+  })
+);
+
+app.delete(
+  '/api/listas/:id',
+  rota((req, res) => {
+    db.prepare('DELETE FROM listas_questoes WHERE id = ?').run(req.params.id);
+    res.json({ ok: true });
+  })
+);
+
+/**
+ * "Corrigir com a IA": injeta o contexto da lista como uma mensagem visivel do
+ * usuario no chat do bloco e pede a primeira resposta. A correcao e informativa
+ * e NUNCA altera o status da lista.
+ */
+app.post(
+  '/api/listas/:id/corrigir',
+  rota(async (req, res) => {
+    const lista = db.prepare('SELECT * FROM listas_questoes WHERE id = ?').get(req.params.id);
+    if (!lista) return res.status(404).json({ erro: 'Lista não encontrada.' });
+
+    const modo = lista.contexto === 'projeto' ? 'projeto' : 'prova';
+    const questoes = textoDasQuestoes(lista.enunciado);
+    const contexto = [
+      `Quero corrigir minhas respostas da lista "${lista.titulo}".`,
+      '',
+      'Questões:',
+      questoes,
+      '',
+      'Vou colar minhas respostas na próxima mensagem. Não atribua nota nem pontuação.',
+    ].join('\n');
+
+    const minha = salvarMensagem(lista.bloco_id, null, 'usuario', contexto, modo);
+    try {
+      const texto = await conversarBloco(historicoSondagem(lista.bloco_id, null), modo);
+      return res.json({
+        mensagens: [minha, salvarMensagem(lista.bloco_id, null, 'assistente', texto, modo)],
+        erro: null,
+      });
+    } catch (e) {
+      return res.json({ mensagens: [minha], erro: `A IA não respondeu (${e.message}).` });
+    }
+  })
+);
+
+/** Converte o campo enunciado (JSON estruturado ou texto puro) em texto legivel. */
+function textoDasQuestoes(enunciado) {
+  try {
+    const dados = JSON.parse(enunciado);
+    if (Array.isArray(dados)) {
+      return dados.map((q) => `${q.numero}. ${q.enunciado}`).join('\n\n');
+    }
+  } catch {
+    /* nao era JSON: e texto puro */
+  }
+  return String(enunciado ?? '');
+}
+
+// ===========================================================================
+// IA — listas de questoes
+// ===========================================================================
+function textoDosDocumentos(blocoId, ids) {
+  const todos = db
+    .prepare('SELECT id, conteudo_texto FROM documentos_fonte WHERE bloco_id = ? ORDER BY criado_em')
+    .all(blocoId);
+  const escolhidos = Array.isArray(ids) && ids.length ? todos.filter((d) => ids.includes(d.id)) : todos;
+  return escolhidos.map((d) => d.conteudo_texto).join('\n\n---\n\n');
+}
+
+app.post(
+  '/api/ia/lista-questoes',
+  rota(async (req, res) => {
+    const { bloco_id, topico_id, quantidade, fonte } = req.body ?? {};
+    const topico = db.prepare('SELECT * FROM topicos WHERE id = ?').get(topico_id);
+    if (!topico) return res.status(404).json({ erro: 'Tópico não encontrado.' });
+
+    const daInternet = fonte?.tipo === 'internet';
+    const entrada = daInternet
+      ? { tipo: 'internet' }
+      : { tipo: 'documentos', texto: textoDosDocumentos(bloco_id, fonte?.documentos_ids) };
+
+    res.json(await gerarListaQuestoes(entrada, topico.titulo, quantidade));
+  })
+);
+
+app.post(
+  '/api/ia/gabarito',
+  rota(async (req, res) => {
+    res.json(await gerarGabarito(req.body?.questoes));
+  })
+);
+
+// ===========================================================================
+// ENTREGAVEIS
+// ===========================================================================
+function topicosDoEntregavel(entregavelId) {
+  return db
+    .prepare(
+      `SELECT t.id, t.titulo, t.peso, t.natureza
+         FROM entregavel_topicos et
+         JOIN topicos t ON t.id = et.topico_id
+        WHERE et.entregavel_id = ?
+        ORDER BY t.ordem`
+    )
+    .all(entregavelId);
+}
+
+const comTopicos = (e) => ({ ...e, topicos: topicosDoEntregavel(e.id) });
+
+app.get(
+  '/api/blocos/:id/entregaveis',
+  rota((req, res) => {
+    const lista = db
+      .prepare('SELECT * FROM entregaveis WHERE bloco_id = ? ORDER BY (data_entrega IS NULL), data_entrega, criado_em')
+      .all(req.params.id);
+    res.json(lista.map(comTopicos));
+  })
+);
+
+function gravarTopicos(entregavelId, topicoIds) {
+  db.prepare('DELETE FROM entregavel_topicos WHERE entregavel_id = ?').run(entregavelId);
+  const inserir = db.prepare('INSERT INTO entregavel_topicos (id, entregavel_id, topico_id) VALUES (?,?,?)');
+  for (const topicoId of new Set(Array.isArray(topicoIds) ? topicoIds : [])) {
+    if (db.prepare('SELECT id FROM topicos WHERE id = ?').get(topicoId)) {
+      inserir.run(novoId(), entregavelId, topicoId);
+    }
+  }
+}
+
+app.post(
+  '/api/blocos/:id/entregaveis',
+  rota((req, res) => {
+    const b = req.body ?? {};
+    if (!b.titulo?.trim()) return res.status(400).json({ erro: 'Informe o nome do entregável.' });
+    const id = novoId();
+    db.prepare(
+      `INSERT INTO entregaveis
+        (id, bloco_id, titulo, descricao, data_entrega, ferramentas, tempo_estimado_horas, concluido, status, criado_em)
+       VALUES (?,?,?,?,?,?,?,0,NULL,?)`
+    ).run(
+      id,
+      req.params.id,
+      b.titulo.trim(),
+      b.descricao?.trim() || null,
+      b.data_entrega || null,
+      b.ferramentas?.trim() || null,
+      b.tempo_estimado_horas === '' || b.tempo_estimado_horas == null ? null : Number(b.tempo_estimado_horas),
+      agora()
+    );
+    gravarTopicos(id, b.topico_ids);
+    res.status(201).json(comTopicos(db.prepare('SELECT * FROM entregaveis WHERE id = ?').get(id)));
+  })
+);
+
+app.patch(
+  '/api/entregaveis/:id',
+  rota((req, res) => {
+    const atual = db.prepare('SELECT * FROM entregaveis WHERE id = ?').get(req.params.id);
+    if (!atual) return res.status(404).json({ erro: 'Entregável não encontrado.' });
+    const b = req.body ?? {};
+
+    db.prepare(
+      `UPDATE entregaveis SET titulo = ?, descricao = ?, data_entrega = ?, ferramentas = ?,
+        tempo_estimado_horas = ? WHERE id = ?`
+    ).run(
+      b.titulo?.trim() || atual.titulo,
+      b.descricao === undefined ? atual.descricao : b.descricao?.trim() || null,
+      b.data_entrega === undefined ? atual.data_entrega : b.data_entrega || null,
+      b.ferramentas === undefined ? atual.ferramentas : b.ferramentas?.trim() || null,
+      b.tempo_estimado_horas === undefined
+        ? atual.tempo_estimado_horas
+        : b.tempo_estimado_horas === '' || b.tempo_estimado_horas === null
+          ? null
+          : Number(b.tempo_estimado_horas),
+      atual.id
+    );
+    if (b.topico_ids !== undefined) gravarTopicos(atual.id, b.topico_ids);
+    res.json(comTopicos(db.prepare('SELECT * FROM entregaveis WHERE id = ?').get(atual.id)));
+  })
+);
+
+/**
+ * Reagendar apenas move a data de entrega. Nunca conta como atraso, falha ou
+ * pendencia negativa.
+ */
+app.post(
+  '/api/entregaveis/:id/reagendar',
+  rota((req, res) => {
+    const data = String(req.body?.data_entrega || '').slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(data)) return res.status(400).json({ erro: 'Informe uma data válida.' });
+    const r = db.prepare('UPDATE entregaveis SET data_entrega = ? WHERE id = ?').run(data, req.params.id);
+    if (r.changes === 0) return res.status(404).json({ erro: 'Entregável não encontrado.' });
+    res.json({ ok: true });
+  })
+);
+
+const ORDEM_PESO = { alto: 0, medio: 1, baixo: 2 };
+const LIMITE_TESTES_AUTOMATICOS = 3;
+
+/**
+ * Conclui (ou desmarca) um entregavel. Ao concluir, registra uma evidencia para
+ * CADA topico associado e, se o bloco tiver a sugestao automatica ligada, gera
+ * ate LIMITE_TESTES_AUTOMATICOS testes teoricos, priorizando os topicos de maior peso.
+ */
+app.post(
+  '/api/entregaveis/:id/concluir',
+  rota(async (req, res) => {
+    const entregavel = db.prepare('SELECT * FROM entregaveis WHERE id = ?').get(req.params.id);
+    if (!entregavel) return res.status(404).json({ erro: 'Entregável não encontrado.' });
+
+    const concluido = req.body?.concluido === undefined ? true : Boolean(req.body.concluido);
+    const jaEstava = entregavel.concluido === 1;
+
+    db.prepare('UPDATE entregaveis SET concluido = ?, concluido_em = ? WHERE id = ?').run(
+      concluido ? 1 : 0,
+      concluido ? agora() : null,
+      entregavel.id
+    );
+
+    if (!concluido || jaEstava) {
+      return res.json({ ok: true, testes_gerados: [], erro: null });
+    }
+
+    const topicos = topicosDoEntregavel(entregavel.id);
+    const inserirEvidencia = db.prepare(
+      'INSERT INTO evidencias (id, topico_id, modo, descricao, data) VALUES (?,?,?,?,?)'
+    );
+    for (const t of topicos) {
+      inserirEvidencia.run(novoId(), t.id, 'projeto', `Entregável ${entregavel.titulo} concluído`, agora());
+    }
+
+    const bloco = db.prepare('SELECT * FROM blocos WHERE id = ?').get(entregavel.bloco_id);
+    if (bloco?.sugerir_testes_auto !== 1 || topicos.length === 0) {
+      return res.json({ ok: true, testes_gerados: [], erro: null });
+    }
+
+    const material = textoDosDocumentos(entregavel.bloco_id, null);
+    if (!material.trim()) {
+      return res.json({
+        ok: true,
+        testes_gerados: [],
+        erro:
+          'Entregável concluído. Os testes automáticos não foram gerados porque este bloco ainda não tem documentos-fonte — use "Pedir teste de um tópico" para escolher outra fonte.',
+      });
+    }
+
+    // Limite rigido: no maximo 3 testes por vez, priorizando os de maior peso.
+    const prioritarios = [...topicos]
+      .sort((a, b) => (ORDEM_PESO[a.peso] ?? 1) - (ORDEM_PESO[b.peso] ?? 1))
+      .slice(0, LIMITE_TESTES_AUTOMATICOS);
+
+    const gerados = [];
+    const problemas = [];
+    for (const topico of prioritarios) {
+      const r = await gerarListaQuestoes({ tipo: 'documentos', texto: material }, topico.titulo, 5);
+      if (r.erro || r.questoes.length === 0) {
+        problemas.push(`${topico.titulo}: ${r.erro ?? 'sem questões'}`);
+        continue;
+      }
+      const id = novoId();
+      db.prepare(
+        `INSERT INTO listas_questoes
+          (id, bloco_id, topico_id, titulo, enunciado, gabarito, origem, status, quantidade, contexto, criado_em)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)`
+      ).run(
+        id,
+        entregavel.bloco_id,
+        topico.id,
+        `Teste teórico — ${topico.titulo}`,
+        JSON.stringify(r.questoes),
+        JSON.stringify(r.gabarito),
+        'gerada_fontes',
+        'nao_feita',
+        r.questoes.length,
+        'projeto',
+        agora()
+      );
+      gerados.push(db.prepare(`${SQL_LISTAS} WHERE l.id = ?`).get(id));
+    }
+
+    res.json({
+      ok: true,
+      testes_gerados: gerados,
+      erro: problemas.length ? `Alguns testes não foram gerados — ${problemas.join('; ')}` : null,
+    });
+  })
+);
+
+app.delete(
+  '/api/entregaveis/:id',
+  rota((req, res) => {
+    db.prepare('DELETE FROM entregaveis WHERE id = ?').run(req.params.id);
+    res.json({ ok: true });
+  })
+);
+
+app.post(
+  '/api/ia/sugerir-entregaveis',
+  rota(async (req, res) => {
+    const { bloco_id, descricao } = req.body ?? {};
+    const topicos = db.prepare('SELECT id, titulo FROM topicos WHERE bloco_id = ? ORDER BY ordem').all(bloco_id);
+    const r = await sugerirEntregaveis(descricao, topicos);
+
+    // Devolve os ids dos topicos para que o cartao de proposta ja venha ligado.
+    const porTitulo = new Map(topicos.map((t) => [t.titulo.toLowerCase(), t.id]));
+    res.json({
+      ...r,
+      entregaveis: r.entregaveis.map((e) => ({
+        ...e,
+        topico_ids: e.topicos.map((t) => porTitulo.get(t.toLowerCase())).filter(Boolean),
+      })),
+    });
   })
 );
 

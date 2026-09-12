@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { api } from '../api';
-import type { Bloco, Modo } from '../tipos';
+import { api, apiListas } from '../api';
+import type { Bloco, ListaQuestoes, Modo } from '../tipos';
 import { cn } from '../util';
 import { ConstruirTabela } from './ConstruirTabela';
 import { ModoAprendizagem } from './ModoAprendizagem';
+import { ModoProva } from './ModoProva';
+import { ModoProjeto } from './ModoProjeto';
+import { ChatBloco } from '../componentes/ChatBloco';
 import { ModalConfiguracoes } from '../componentes/ModalConfiguracoes';
 import { Carregando, Etiqueta, IconeChevron, IconeEngrenagem, Vazio } from '../componentes/ui';
 
@@ -13,6 +16,8 @@ const MODOS: { valor: Modo; rotulo: string }[] = [
   { valor: 'projeto', rotulo: 'Modo Projeto' },
   { valor: 'aprendizagem', rotulo: 'Modo Aprendizagem' },
 ];
+
+const CHAVE_CHAT = 'chat-bloco-aberto';
 
 export function PaginaBloco() {
   const { id = '' } = useParams();
@@ -23,6 +28,25 @@ export function PaginaBloco() {
   // Aprendizagem é o modo padrão ao abrir.
   const [modo, setModo] = useState<Modo>('aprendizagem');
   const [config, setConfig] = useState<'relacoes' | 'tabela' | null>(null);
+
+  // O chat lateral acompanha os três modos e sobrevive à troca de modo.
+  const [chatAberto, setChatAberto] = useState(() => {
+    try {
+      return localStorage.getItem(CHAVE_CHAT) === '1';
+    } catch {
+      return false;
+    }
+  });
+  const [chatVersao, setChatVersao] = useState(0);
+
+  const alternarChat = (aberto: boolean) => {
+    setChatAberto(aberto);
+    try {
+      localStorage.setItem(CHAVE_CHAT, aberto ? '1' : '0');
+    } catch {
+      // armazenamento indisponível — vale só para esta sessão
+    }
+  };
 
   const carregar = useCallback(async () => {
     try {
@@ -37,6 +61,16 @@ export function PaginaBloco() {
   useEffect(() => {
     void carregar();
   }, [carregar]);
+
+  /**
+   * "Corrigir com a IA": o contexto da lista entra no chat do bloco como uma
+   * mensagem visível. A correção é informativa e não altera o status da lista.
+   */
+  const corrigirNoChat = useCallback(async (lista: ListaQuestoes) => {
+    await apiListas.corrigir(lista.id);
+    alternarChat(true);
+    setChatVersao((v) => v + 1);
+  }, []);
 
   if (carregando) {
     return (
@@ -62,8 +96,10 @@ export function PaginaBloco() {
     );
   }
 
+  const tabelaPendente = bloco.tabela_conteudos_construida === 0;
+
   return (
-    <div>
+    <div className="flex h-full flex-col">
       <Cabecalho bloco={bloco}>
         {/* Alternador de três modos */}
         <div className="flex rounded-lg border border-zinc-300 p-0.5 dark:border-zinc-700">
@@ -93,20 +129,36 @@ export function PaginaBloco() {
         </button>
       </Cabecalho>
 
-      {modo !== 'aprendizagem' ? (
-        <div className="flex min-h-[50vh] items-center justify-center px-6">
-          <p className="text-sm text-zinc-500 dark:text-zinc-400">
-            Este modo será implementado na próxima etapa.
-          </p>
+      <div className="flex min-h-0 flex-1">
+        <div className="min-w-0 flex-1 overflow-y-auto">
+          {modo === 'aprendizagem' ? (
+            tabelaPendente ? (
+              // Primeira entrada no bloco: as três opções de construção da tabela.
+              // O alternador de modos continua disponível — os modos são lentes,
+              // não etapas: nenhum é bloqueado por falta de progresso em outro.
+              <ConstruirTabela bloco={bloco} aoConcluir={() => void carregar()} />
+            ) : (
+              <ModoAprendizagem bloco={bloco} aoAbrirTabela={() => setConfig('tabela')} />
+            )
+          ) : modo === 'prova' ? (
+            <ModoProva bloco={bloco} aoCorrigir={corrigirNoChat} />
+          ) : (
+            <ModoProjeto
+              bloco={bloco}
+              aoCorrigir={corrigirNoChat}
+              aoAtualizarBloco={() => void carregar()}
+            />
+          )}
         </div>
-      ) : bloco.tabela_conteudos_construida === 0 ? (
-        // Primeira entrada no bloco: as três opções de construção da tabela.
-        // O alternador de modos continua disponível — os modos são lentes,
-        // não etapas: nenhum é bloqueado por falta de progresso em outro.
-        <ConstruirTabela bloco={bloco} aoConcluir={() => void carregar()} />
-      ) : (
-        <ModoAprendizagem bloco={bloco} aoAbrirTabela={() => setConfig('tabela')} />
-      )}
+
+        <ChatBloco
+          blocoId={bloco.id}
+          modo={modo}
+          aberto={chatAberto}
+          aoAlternar={alternarChat}
+          versao={chatVersao}
+        />
+      </div>
 
       <ModalConfiguracoes
         bloco={bloco}
@@ -121,7 +173,7 @@ export function PaginaBloco() {
 
 function Cabecalho({ bloco, children }: { bloco: Bloco; children?: React.ReactNode }) {
   return (
-    <header className="border-b border-zinc-200 bg-white px-6 py-4 dark:border-zinc-800 dark:bg-zinc-900">
+    <header className="shrink-0 border-b border-zinc-200 bg-white px-6 py-4 dark:border-zinc-800 dark:bg-zinc-900">
       <div className="mx-auto flex max-w-5xl flex-wrap items-center justify-between gap-3">
         <div className="min-w-0">
           <nav className="mb-0.5 flex items-center gap-1 text-xs text-zinc-500 dark:text-zinc-400">

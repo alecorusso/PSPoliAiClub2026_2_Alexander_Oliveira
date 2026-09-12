@@ -25,6 +25,7 @@ export interface Bloco {
   faltas_registradas: number;
   media_aprovacao: number | null;
   tabela_conteudos_construida: number;
+  sugerir_testes_auto: number;
   ultimo_acesso: string | null;
   criado_em: string;
 }
@@ -109,4 +110,79 @@ export interface LinhaEditor {
   natureza: Natureza;
   peso: Peso;
   nivel: number;
+}
+
+// ---------------------------------------------------------------------------
+// Modo Prova — listas de questões
+// ---------------------------------------------------------------------------
+export type OrigemLista = 'enviada' | 'gerada_fontes' | 'gerada_internet';
+export type StatusLista = 'nao_feita' | 'incompleta' | 'completa';
+/** 'prova' = listas do Modo Prova; 'projeto' = testes teóricos do Modo Projeto. */
+export type ContextoLista = 'prova' | 'projeto';
+
+export interface Questao {
+  numero: number;
+  enunciado: string;
+}
+
+export interface RespostaGabarito {
+  numero: number;
+  resposta: string;
+}
+
+export interface ListaQuestoes {
+  id: string;
+  bloco_id: string;
+  topico_id: string | null;
+  titulo: string;
+  /** JSON de Questao[] quando gerada, ou texto puro quando enviada. */
+  enunciado: string;
+  gabarito: string | null;
+  origem: OrigemLista;
+  status: StatusLista;
+  quantidade: number | null;
+  contexto: ContextoLista;
+  criado_em: string;
+  topico_titulo: string | null;
+  topico_peso: Peso | null;
+}
+
+export interface RespostaLista {
+  questoes: Questao[];
+  gabarito: RespostaGabarito[];
+  erro: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Modo Projeto — entregáveis
+// ---------------------------------------------------------------------------
+export interface TopicoDoEntregavel {
+  id: string;
+  titulo: string;
+  peso: Peso;
+  natureza: Natureza;
+}
+
+export interface Entregavel {
+  id: string;
+  bloco_id: string;
+  titulo: string;
+  descricao: string | null;
+  data_entrega: string | null;
+  ferramentas: string | null;
+  tempo_estimado_horas: number | null;
+  concluido: number;
+  concluido_em: string | null;
+  criado_em: string;
+  topicos: TopicoDoEntregavel[];
+}
+
+/** Proposta da IA: ainda não existe no banco até o usuário clicar em "Adicionar". */
+export interface SugestaoEntregavel {
+  titulo: string;
+  descricao: string;
+  ferramentas: string;
+  tempo_estimado_horas: number | null;
+  topicos: string[];
+  topico_ids: string[];
 }

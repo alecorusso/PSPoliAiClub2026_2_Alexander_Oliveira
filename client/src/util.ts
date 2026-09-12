@@ -1,4 +1,14 @@
-import type { LinhaEditor, Natureza, Peso, Topico, TopicoSugerido } from './tipos';
+import type {
+  LinhaEditor,
+  Natureza,
+  OrigemLista,
+  Peso,
+  Questao,
+  RespostaGabarito,
+  StatusLista,
+  Topico,
+  TopicoSugerido,
+} from './tipos';
 
 export function cn(...partes: Array<string | false | null | undefined>) {
   return partes.filter(Boolean).join(' ');
@@ -229,3 +239,67 @@ export function inserirFilho(linhas: LinhaEditor[], i: number): LinhaEditor[] {
   const nova: LinhaEditor = { id: novoId(), titulo: '', natureza: 'declarativo', peso: 'medio', nivel };
   return [...linhas.slice(0, i + 1), nova, ...linhas.slice(i + 1)];
 }
+
+// ---------------------------------------------------------------------------
+// Listas de questões
+// ---------------------------------------------------------------------------
+export const ROTULO_ORIGEM: Record<OrigemLista, string> = {
+  enviada: 'Enviada',
+  gerada_fontes: 'Gerada de documentos',
+  gerada_internet: 'Gerada da internet',
+};
+
+export const ROTULO_STATUS_LISTA: Record<StatusLista, string> = {
+  nao_feita: 'Não feita',
+  incompleta: 'Incompleta',
+  completa: 'Completa',
+};
+
+export const STATUS_LISTA: StatusLista[] = ['nao_feita', 'incompleta', 'completa'];
+
+/**
+ * Questões e gabarito são guardados como JSON quando gerados pela IA e como
+ * texto puro quando a lista foi colada ou enviada pelo usuário. Estas funções
+ * devolvem a forma estruturada quando existir, e o texto cru caso contrário.
+ */
+export function lerQuestoes(bruto: string | null): Questao[] | string {
+  if (!bruto) return '';
+  try {
+    const dados = JSON.parse(bruto);
+    if (Array.isArray(dados) && dados.every((q) => q && typeof q.enunciado === 'string')) {
+      return dados as Questao[];
+    }
+  } catch {
+    /* não era JSON: é texto puro */
+  }
+  return bruto;
+}
+
+export function lerGabarito(bruto: string | null): RespostaGabarito[] | string | null {
+  if (!bruto) return null;
+  try {
+    const dados = JSON.parse(bruto);
+    if (Array.isArray(dados) && dados.every((g) => g && typeof g.resposta === 'string')) {
+      return dados as RespostaGabarito[];
+    }
+  } catch {
+    /* não era JSON: é texto puro */
+  }
+  return bruto;
+}
+
+/** Converte um texto colado em questões numeradas, quando possível. */
+export function textoParaQuestoes(texto: string): Questao[] | string {
+  const linhas = texto.split(/\n\s*(?=\d+[).\s])/).map((l) => l.trim()).filter(Boolean);
+  if (linhas.length < 2) return texto;
+  return linhas.map((linha, i) => {
+    const casou = linha.match(/^(\d+)[).\s]\s*([\s\S]*)$/);
+    return {
+      numero: casou ? Number(casou[1]) : i + 1,
+      enunciado: (casou ? casou[2] : linha).trim(),
+    };
+  });
+}
+
+export const contarQuestoes = (questoes: Questao[] | string) =>
+  Array.isArray(questoes) ? questoes.length : 0;
