@@ -140,6 +140,20 @@ CREATE TABLE IF NOT EXISTS avaliacoes (
   criado_em TEXT
 );
 
+CREATE TABLE IF NOT EXISTS sessoes_foco (
+  id TEXT PRIMARY KEY,
+  bloco_id TEXT NULL REFERENCES blocos(id) ON DELETE SET NULL,
+  inicio TEXT,
+  fim TEXT NULL
+);
+
+CREATE TABLE IF NOT EXISTS compromissos_diarios (
+  id TEXT PRIMARY KEY,
+  data TEXT,
+  descricao TEXT,
+  concluido INTEGER DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS idx_blocos_pasta ON blocos(pasta_id);
 CREATE INDEX IF NOT EXISTS idx_pastas_pai ON pastas(pasta_pai_id);
 CREATE INDEX IF NOT EXISTS idx_topicos_bloco ON topicos(bloco_id);
@@ -164,6 +178,10 @@ const COLUNAS_NOVAS = [
   ['entregaveis', 'concluido_em', 'TEXT NULL'],
   // Preferencia por bloco: gerar testes teoricos ao concluir um entregavel
   ['blocos', 'sugerir_testes_auto', 'INTEGER DEFAULT 0'],
+  // Wrapper academico: a nota e um dado informado pelo usuario, nunca calculado
+  // ou atribuido pela plataforma.
+  ['avaliacoes', 'nota', 'REAL NULL'],
+  ['avaliacoes', 'ordem', 'INTEGER DEFAULT 0'],
 ];
 
 function garantirColuna(tabela, coluna, definicao) {
@@ -181,6 +199,9 @@ export function migrar() {
     CREATE INDEX IF NOT EXISTS idx_listas_bloco ON listas_questoes(bloco_id, contexto);
     CREATE INDEX IF NOT EXISTS idx_entregaveis_bloco ON entregaveis(bloco_id);
     CREATE INDEX IF NOT EXISTS idx_entregavel_topicos ON entregavel_topicos(entregavel_id);
+    CREATE INDEX IF NOT EXISTS idx_avaliacoes_bloco ON avaliacoes(bloco_id);
+    CREATE INDEX IF NOT EXISTS idx_compromissos_data ON compromissos_diarios(data);
+    CREATE INDEX IF NOT EXISTS idx_sessoes_foco_inicio ON sessoes_foco(inicio);
   `);
 }
 

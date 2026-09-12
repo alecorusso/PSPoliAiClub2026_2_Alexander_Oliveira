@@ -1,4 +1,5 @@
 import type {
+  LinhaAvaliacao,
   LinhaEditor,
   Natureza,
   OrigemLista,
@@ -303,3 +304,166 @@ export function textoParaQuestoes(texto: string): Questao[] | string {
 
 export const contarQuestoes = (questoes: Questao[] | string) =>
   Array.isArray(questoes) ? questoes.length : 0;
+
+// ---------------------------------------------------------------------------
+// Wrapper acadêmico — aritmética de médias
+//
+// Nada aqui é um julgamento da plataforma: as notas são dado acadêmico
+// informado pelo usuário, e o cálculo é a aritmética que ele mesmo faria.
+// ---------------------------------------------------------------------------
+
+export const numeroOuNulo = (v: string | number | null | undefined): number | null => {
+  if (v === '' || v === null || v === undefined) return null;
+  const n = Number(String(v).replace(',', '.'));
+  return Number.isFinite(n) ? n : null;
+};
+
+export type SituacaoMedia =
+  | 'sem_dados'
+  | 'em_andamento'
+  | 'garantida'
+  | 'inalcancavel'
+  | 'sem_restantes';
+
+export interface ResultadoMedias {
+  /** Só avaliações com nota informada, ponderada por peso. */
+  mediaAtual: number | null;
+  /** Notas reais + simuladas; as demais assumem a média atual. */
+  mediaProjetada: number | null;
+  /** Média exigida nas restantes para atingir a média de aprovação. */
+  notaNecessaria: number | null;
+  situacao: SituacaoMedia;
+  pesoTotal: number;
+  pesoComNota: number;
+  pesoRestante: number;
+  /** Escala inferida das notas informadas (10 ou 100), usada só para dizer se algo é inalcançável. */
+  escala: number;
+  avisoPesos: string | null;
+}
+
+/**
+ * `somaEsperada` é o total que os pesos deveriam fechar (10, 100…), escolhido
+ * pelo usuário. Com `null`, os pesos são tratados como relativos e só um
+ * quase-acerto (a menos de 5% de 10 ou 100) é sinalizado como possível engano.
+ */
+export function calcularMedias(
+  linhas: LinhaAvaliacao[],
+  simuladas: Record<string, string>,
+  mediaAprovacao: number | null,
+  somaEsperada: number | null = null
+): ResultadoMedias {
+  const itens = linhas.map((l) => ({
+    peso: numeroOuNulo(l.peso) ?? 0,
+    nota: numeroOuNulo(l.nota),
+    simulada: numeroOuNulo(simuladas[l.id] ?? ''),
+    semPeso: numeroOuNulo(l.peso) === null,
+  }));
+
+  const pesoTotal = itens.reduce((s, i) => s + i.peso, 0);
+  const comNota = itens.filter((i) => i.nota !== null);
+  const pesoComNota = comNota.reduce((s, i) => s + i.peso, 0);
+  const pesoRestante = pesoTotal - pesoComNota;
+
+  const mediaAtual =
+    pesoComNota > 0 ? comNota.reduce((s, i) => s + (i.nota ?? 0) * i.peso, 0) / pesoComNota : null;
+
+  // Escala: 100 quando alguma nota ou a média de aprovação passa de 10; senão 10.
+  const valores = [
+    ...itens.map((i) => i.nota ?? 0),
+    ...itens.map((i) => i.simulada ?? 0),
+    mediaAprovacao ?? 0,
+  ];
+  const escala = valores.some((v) => v > 10) ? 100 : 10;
+
+  // Projeção: notas reais, depois as simuladas, e o que sobrar assume a média atual.
+  let mediaProjetada: number | null = null;
+  if (pesoTotal > 0 && (mediaAtual !== null || itens.some((i) => i.simulada !== null))) {
+    const baseParaOResto = mediaAtual ?? 0;
+    const soma = itens.reduce((s, i) => {
+      const valor = i.nota ?? i.simulada ?? baseParaOResto;
+      return s + valor * i.peso;
+    }, 0);
+    mediaProjetada = soma / pesoTotal;
+  }
+
+  // Nota necessária nas restantes para fechar a média de aprovação.
+  let notaNecessaria: number | null = null;
+  let situacao: SituacaoMedia = 'sem_dados';
+
+  if (mediaAprovacao === null || pesoTotal === 0) {
+    situacao = 'sem_dados';
+  } else if (pesoRestante <= 0) {
+    situacao = 'sem_restantes';
+  } else {
+    const acumulado = comNota.reduce((s, i) => s + (i.nota ?? 0) * i.peso, 0);
+    notaNecessaria = (mediaAprovacao * pesoTotal - acumulado) / pesoRestante;
+    if (notaNecessaria <= 0) situacao = 'garantida';
+    else if (notaNecessaria > escala) situacao = 'inalcancavel';
+    else situacao = 'em_andamento';
+  }
+
+  // Aviso informativo sobre os pesos — nunca impede o uso da calculadora.
+  let avisoPesos: string | null = null;
+  const semPeso = itens.filter((i) => i.semPeso).length;
+  const quaseFecha = [10, 100].find(
+    (alvo) => Math.abs(pesoTotal - alvo) > 1e-9 && Math.abs(pesoTotal - alvo) <= alvo * 0.05
+  );
+
+  if (semPeso > 0) {
+    avisoPesos =
+      semPeso === 1
+        ? 'Uma avaliação está sem peso e por isso não entra no cálculo.'
+        : `${semPeso} avaliações estão sem peso e por isso não entram no cálculo.`;
+  } else if (somaEsperada !== null && Math.abs(pesoTotal - somaEsperada) > 1e-9) {
+    avisoPesos = `A soma dos pesos é ${formatarNota(pesoTotal)}, e não ${formatarNota(somaEsperada)}.`;
+  } else if (somaEsperada === null && quaseFecha) {
+    avisoPesos = `A soma dos pesos é ${formatarNota(pesoTotal)} — perto de ${quaseFecha}, mas não exatamente.`;
+  }
+
+  return {
+    mediaAtual,
+    mediaProjetada,
+    notaNecessaria,
+    situacao,
+    pesoTotal,
+    pesoComNota,
+    pesoRestante,
+    escala,
+    avisoPesos,
+  };
+}
+
+export function formatarNota(n: number | null | undefined) {
+  if (n === null || n === undefined || !Number.isFinite(n)) return '—';
+  return n.toLocaleString('pt-BR', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+}
+
+/** Texto neutro sobre as faltas restantes. Nunca cobrança nem culpa. */
+export function textoFaltas(registradas: number, limite: number | null) {
+  if (limite === null || limite <= 0) return 'Sem limite de faltas registrado.';
+  const restam = limite - registradas;
+  if (restam > 1) return `Restam ${restam} faltas.`;
+  if (restam === 1) return 'Resta 1 falta.';
+  if (restam === 0) return 'O limite de faltas foi atingido.';
+  return `O limite foi ultrapassado em ${Math.abs(restam)} ${Math.abs(restam) === 1 ? 'falta' : 'faltas'}.`;
+}
+
+/** Formata uma duração em milissegundos como "1 h 12 min" ou "48 s". */
+export function formatarDuracao(ms: number) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return `${h} h ${String(m).padStart(2, '0')} min`;
+  if (m > 0) return `${m} min ${String(s).padStart(2, '0')} s`;
+  return `${s} s`;
+}
+
+/** Cronômetro em hh:mm:ss. */
+export function relogio(ms: number) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return [h, m, s].map((n) => String(n).padStart(2, '0')).join(':');
+}

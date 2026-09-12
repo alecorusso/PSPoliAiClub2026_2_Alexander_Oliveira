@@ -3,9 +3,10 @@ import { api } from '../api';
 import type { Bloco, LinhaEditor, Relacao, TipoRelacao, Topico } from '../tipos';
 import { cn, linhasParaPayload, topicosParaLinhas } from '../util';
 import { EditorTabelaConteudos } from './EditorTabelaConteudos';
+import { AbaWrapperAcademico } from './AbaWrapperAcademico';
 import { Aviso, Carregando, IconeBusca, IconeLink, IconeLixeira, Modal, Vazio } from './ui';
 
-type Aba = 'relacoes' | 'tabela';
+type Aba = 'relacoes' | 'tabela' | 'academico';
 
 const TIPOS: { valor: TipoRelacao; rotulo: string }[] = [
   { valor: 'pre_requisito', rotulo: 'é pré-requisito de' },
@@ -31,6 +32,7 @@ export function ModalConfiguracoes({
   aberto: boolean;
   abaInicial?: Aba;
   aoFechar: () => void;
+  /** Recarrega o bloco no pai — usada pela tabela e pelo contador de faltas. */
   aoSalvarTabela: () => void;
 }) {
   const [aba, setAba] = useState<Aba>(abaInicial);
@@ -46,6 +48,8 @@ export function ModalConfiguracoes({
           [
             ['relacoes', 'Relações'],
             ['tabela', 'Tabela de conteúdos'],
+            // Só faz sentido para disciplinas cursadas.
+            ...(bloco.wrapper_academico === 1 ? [['academico', 'Wrapper acadêmico']] : []),
           ] as [Aba, string][]
         ).map(([valor, rotulo]) => (
           <button
@@ -65,6 +69,8 @@ export function ModalConfiguracoes({
 
       {aba === 'relacoes' ? (
         <AbaRelacoes bloco={bloco} />
+      ) : aba === 'academico' ? (
+        <AbaWrapperAcademico bloco={bloco} aoAtualizarBloco={aoSalvarTabela} />
       ) : (
         <AbaTabela bloco={bloco} aoSalvar={aoSalvarTabela} />
       )}

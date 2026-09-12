@@ -8,8 +8,9 @@ import { ModoAprendizagem } from './ModoAprendizagem';
 import { ModoProva } from './ModoProva';
 import { ModoProjeto } from './ModoProjeto';
 import { ChatBloco } from '../componentes/ChatBloco';
+import { useFoco } from '../estado/foco';
 import { ModalConfiguracoes } from '../componentes/ModalConfiguracoes';
-import { Carregando, Etiqueta, IconeChevron, IconeEngrenagem, Vazio } from '../componentes/ui';
+import { Carregando, Etiqueta, IconeChevron, IconeEngrenagem, IconeRelogio, Vazio } from '../componentes/ui';
 
 const MODOS: { valor: Modo; rotulo: string }[] = [
   { valor: 'prova', rotulo: 'Modo Prova' },
@@ -21,13 +22,14 @@ const CHAVE_CHAT = 'chat-bloco-aberto';
 
 export function PaginaBloco() {
   const { id = '' } = useParams();
+  const { sessao: sessaoFoco, iniciar: iniciarFoco } = useFoco();
   const [bloco, setBloco] = useState<Bloco | null>(null);
   const [carregando, setCarregando] = useState(true);
   const [erro, setErro] = useState<string | null>(null);
   // Os três modos são lentes sobre o mesmo bloco, nunca etapas sequenciais.
   // Aprendizagem é o modo padrão ao abrir.
   const [modo, setModo] = useState<Modo>('aprendizagem');
-  const [config, setConfig] = useState<'relacoes' | 'tabela' | null>(null);
+  const [config, setConfig] = useState<'relacoes' | 'tabela' | 'academico' | null>(null);
 
   // O chat lateral acompanha os três modos e sobrevive à troca de modo.
   const [chatAberto, setChatAberto] = useState(() => {
@@ -118,6 +120,18 @@ export function PaginaBloco() {
             </button>
           ))}
         </div>
+
+        {/* Iniciada daqui, a sessão fica associada a este bloco. */}
+        {!sessaoFoco && (
+          <button
+            className="btn-secundario"
+            onClick={() => void iniciarFoco(bloco.id, bloco.nome)}
+            title="Registrar uma sessão de foco neste bloco"
+          >
+            <IconeRelogio />
+            Iniciar foco
+          </button>
+        )}
 
         <button
           className="btn-secundario px-2"

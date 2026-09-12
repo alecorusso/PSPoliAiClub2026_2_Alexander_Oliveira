@@ -186,3 +186,49 @@ export interface SugestaoEntregavel {
   topicos: string[];
   topico_ids: string[];
 }
+
+// ---------------------------------------------------------------------------
+// Wrapper acadêmico
+// A nota é um dado acadêmico informado pelo usuário — a plataforma nunca gera,
+// infere ou atribui nota.
+// ---------------------------------------------------------------------------
+export interface Avaliacao {
+  id: string;
+  bloco_id: string;
+  titulo: string;
+  peso: number | null;
+  nota: number | null;
+  ordem: number;
+  data: string | null;
+  observacao: string | null;
+  criado_em: string;
+}
+
+/** Linha da grade editável de avaliações (peso e nota podem ficar vazios). */
+export interface LinhaAvaliacao {
+  id: string;
+  titulo: string;
+  peso: string;
+  nota: string;
+}
+
+// ---------------------------------------------------------------------------
+// Sessão de foco — registro voluntário de tempo, sem bloqueio de nada
+// ---------------------------------------------------------------------------
+export interface SessaoFoco {
+  id: string;
+  bloco_id: string | null;
+  inicio: string;
+  fim: string | null;
+  bloco_nome?: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Compromissos diários
+// ---------------------------------------------------------------------------
+export interface Compromisso {
+  id: string;
+  data: string;
+  descricao: string;
+  concluido: number;
+}

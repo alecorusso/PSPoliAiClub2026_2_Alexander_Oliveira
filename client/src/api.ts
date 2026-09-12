@@ -1,5 +1,7 @@
 import type {
+  Avaliacao,
   Bloco,
+  Compromisso,
   ContextoLista,
   DocumentoFonte,
   Entregavel,
@@ -15,6 +17,7 @@ import type {
   RespostaGabarito,
   RespostaLista,
   Revisao,
+  SessaoFoco,
   StatusLista,
   SugestaoEntregavel,
   TipoRelacao,
@@ -189,4 +192,34 @@ export const apiEntregaveis = {
       bloco_id: blocoId,
       descricao,
     }),
+};
+
+// ---------------------------------------------------------------------------
+// Avaliações (wrapper acadêmico)
+// ---------------------------------------------------------------------------
+export const apiAvaliacoes = {
+  listar: (blocoId: string) => get<Avaliacao[]>(`/blocos/${blocoId}/avaliacoes`),
+  salvar: (blocoId: string, avaliacoes: { id: string; titulo: string; peso: string; nota: string }[]) =>
+    put<Avaliacao[]>(`/blocos/${blocoId}/avaliacoes`, { avaliacoes }),
+};
+
+// ---------------------------------------------------------------------------
+// Sessões de foco
+// ---------------------------------------------------------------------------
+export const apiFoco = {
+  ativa: () => get<SessaoFoco | null>('/foco/ativa'),
+  iniciar: (blocoId: string | null) => post<SessaoFoco>('/foco/iniciar', { bloco_id: blocoId }),
+  encerrar: (id: string) => post<SessaoFoco & { decorrido_ms: number }>(`/foco/${id}/encerrar`),
+};
+
+// ---------------------------------------------------------------------------
+// Compromissos diários
+// ---------------------------------------------------------------------------
+export const apiCompromissos = {
+  listar: (data: string) => get<Compromisso[]>(`/compromissos?data=${data}`),
+  datas: () => get<string[]>('/compromissos/datas'),
+  criar: (data: string, descricao: string) => post<Compromisso>('/compromissos', { data, descricao }),
+  atualizar: (id: string, dados: { descricao?: string; concluido?: boolean }) =>
+    patch<Compromisso>(`/compromissos/${id}`, dados),
+  excluir: (id: string) => remover(`/compromissos/${id}`),
 };

@@ -20,6 +20,7 @@ Como é uma aplicação de usuário único rodando localmente, **não há login,
 | Banco | SQLite local em arquivo, via `better-sqlite3` (`server/dados.db`) |
 | IA | API do Google Gemini (Google AI Studio), chamada apenas pelo servidor |
 | Leitura de PDF | `pdfjs-dist` (extração feita no navegador) |
+| Arrastar e soltar | `@dnd-kit/core` |
 
 Monorepo simples, sem workspaces:
 
@@ -99,17 +100,27 @@ na interface, e o caminho manual continua disponível.
 `Início` e `Blocos` funcionais. `Calendário` e `Desempenho` aparecem desabilitados, com tooltip
 "Em desenvolvimento". Tema claro e escuro, com alternador no rodapé.
 
+Também traz **"Iniciar foco"** e, enquanto há sessão aberta, o indicador discreto com o tempo
+corrido, visível em qualquer página.
+
 ### Página Início
 Blocos acessados recentemente e um card "Revisões pendentes hoje", que consulta diretamente as
 revisões com `data_prevista <= hoje` e status diferente de `concluida`.
+
+Um card **"Compromissos de hoje"** com campo de texto livre, checkboxes, edição e exclusão. Itens
+em aberto de dias anteriores **não** são trazidos para hoje nem geram alerta ou contagem de falhas;
+"Ver outro dia" abre a consulta a um dia anterior, apenas para leitura.
 
 ### Página Blocos
 Visão de explorador de arquivos, com blocos e pastas como cards quadrados.
 
 - Botão "Novo" com duas opções: **Novo bloco** e **Nova pasta**
 - Navegação por breadcrumb, com pastas dentro de pastas
+- **Arrastar e soltar** (dnd-kit) blocos e pastas para dentro de pastas, com a pasta sob o cursor
+  destacada; soltar em área vazia deixa o item no nível atual do breadcrumb. Uma pasta nunca entra
+  em si mesma nem numa descendente
 - Menu de contexto (clique direito ou botão `⋯`): favoritar, ocultar, renomear, **mover para…**,
-  excluir — a movimentação é por menu, nunca por arrastar
+  excluir — mantido como caminho equivalente e acessível pelo teclado
 - Busca por nome (global) e filtros "Só favoritos" / "Só ocultos"
 - Ocultar uma pasta esconde seu conteúdo na visualização, mas **não altera** a flag `oculto`
   individual dos blocos de dentro
@@ -135,6 +146,7 @@ A engrenagem abre as configurações, com duas abas:
   A aresta é gravada uma única vez, e o rótulo é invertido conforme a perspectiva: quem é origem de
   `pre_requisito` vê "é pré-requisito de X"; quem é destino vê "depende de X".
 - **Tabela de conteúdos** — abre o editor da árvore.
+- **Wrapper acadêmico** — só aparece quando o bloco é uma disciplina cursada.
 
 ### Primeira entrada num bloco
 Enquanto `tabela_conteudos_construida = 0`, o modo Aprendizagem mostra três opções com peso visual
@@ -261,6 +273,40 @@ Ficam nesta mesma tela — nunca redirecionam para o Modo Prova.
 - Os testes aparecem aqui com o mesmo visualizador do Modo Prova (gabarito recolhido + seletor de
   status) e não se misturam com as listas do Modo Prova.
 
+### Wrapper acadêmico
+Aba das configurações, visível apenas quando `wrapper_academico = 1`.
+
+**Faltas** — `faltas_registradas / limite_faltas` com barra, botões "+1 falta" e "−1 falta" (nunca
+abaixo de zero) e campo de edição direta. O texto do que resta é neutro ("Restam 4 faltas"); ao se
+aproximar do limite fica âmbar, e ao atingir informa o fato ("O limite de faltas foi atingido").
+Nunca vermelho alarmante nem linguagem de cobrança.
+
+**Média e simulação** — grade editável de avaliações (nome, peso, nota; a nota pode ficar vazia),
+gravada em `avaliacoes`, com três resultados ao vivo:
+
+1. **Média atual** — só as avaliações com nota, ponderada por peso.
+2. **Média final projetada** — as restantes assumem a média atual.
+3. **Nota necessária** — a média exigida nas restantes para fechar `media_aprovacao`. Quando a
+   aprovação já está garantida, ou já não é alcançável, o texto diz isso de forma factual.
+
+O toggle **"Simular notas"** preenche notas hipotéticas nas avaliações sem nota, em itálico e com
+fundo distinto; elas recalculam a projeção ao vivo, **nunca** são salvas e não afetam a média atual
+nem a nota necessária. Há botão "Limpar simulação". Um seletor declara a soma esperada dos pesos
+(livre, 10 ou 100) e, quando ela não fecha, aparece um aviso informativo que não impede o uso.
+
+As notas são dado acadêmico informado pelo usuário — a plataforma não gera, infere nem atribui nota.
+
+### Sessão de foco
+Registro voluntário de tempo, iniciável pela barra lateral ou pelo cabeçalho do bloco (nesse caso a
+sessão fica associada ao `bloco_id`). Ao iniciar, um painel em destaque mostra o cronômetro
+crescente, o nome do bloco e os botões "Pausar" e "Encerrar"; o painel pode ser ocultado e a sessão
+continua, com o indicador discreto da barra lateral. Uma sessão aberta sobrevive ao recarregamento
+da página. Ao encerrar, início e fim vão para `sessoes_foco` e o tempo total é exibido (quando houve
+pausas, o resumo mostra também o tempo decorrido e o tempo em pausa).
+
+**Não há bloqueio de sites, abas ou aplicativos** — a própria interface diz isso. Sem meta de tempo,
+streak ou comparação entre dias.
+
 ---
 
 ## Princípios de design
@@ -284,9 +330,10 @@ Estes princípios estão refletidos no código e devem ser preservados em etapas
 ## Banco de dados
 
 Tabelas em uso: `pastas`, `blocos`, `bloco_relacoes`, `topicos`, `revisoes`, `evidencias`,
-`mensagens_chat`, `documentos_fonte`, `listas_questoes`, `entregaveis`, `entregavel_topicos`.
+`mensagens_chat`, `documentos_fonte`, `listas_questoes`, `entregaveis`, `entregavel_topicos`,
+`avaliacoes`, `sessoes_foco`, `compromissos_diarios`.
 
-Já criadas no schema, sem telas ainda (para não exigir migration futura): `eventos` e `avaliacoes`.
+Já criada no schema, sem telas ainda (para não exigir migration futura): `eventos`.
 
 As colunas acrescentadas depois da primeira versão (gabarito e contexto das listas, ferramentas,
 tempo estimado e conclusão dos entregáveis, preferência de testes automáticos do bloco) entram por
@@ -327,6 +374,12 @@ O schema completo está em [`server/db.js`](server/db.js).
 | POST | `/api/entregaveis/:id/concluir` | Conclui, registra evidências e pode gerar testes |
 | POST | `/api/entregaveis/:id/reagendar` | Move a data de entrega |
 | POST | `/api/ia/sugerir-entregaveis` | Propostas de entregáveis (nada é salvo) |
+| GET/PUT | `/api/blocos/:id/avaliacoes` | Grade de avaliações do wrapper acadêmico |
+| GET/POST | `/api/foco/ativa`, `/api/foco/iniciar` | Sessão de foco aberta e início de sessão |
+| POST | `/api/foco/:id/encerrar` | Encerra e devolve a duração |
+| GET/POST | `/api/compromissos` | Compromissos de um dia (padrão: hoje) |
+| PATCH/DELETE | `/api/compromissos/:id` | Editar, concluir ou excluir |
+| GET | `/api/compromissos/datas` | Dias que já têm registro, para a consulta |
 | GET | `/api/inicio` | Blocos recentes e revisões pendentes hoje |
 
 ---
@@ -337,11 +390,11 @@ Ficou fora desta etapa:
 
 - **Cronograma dinâmico** — o Início traz só a lista simples de revisões pendentes hoje.
 - **Página de Calendário** — entrada desabilitada na barra lateral; a tabela `eventos` já existe.
-- **Página de Desempenho** — entrada desabilitada na barra lateral; a tabela `avaliacoes` já existe.
+- **Página de Desempenho** — entrada desabilitada na barra lateral. As avaliações e as sessões de
+  foco já são gravadas, mas não há tela de histórico agregado.
 - **Visão de grafo dos blocos** — as relações já são gravadas e exibidas em lista, mas não há
   visualização em grafo.
-- **Ferramentas acadêmicas** — controle de faltas e de médias. Os campos `limite_faltas`,
-  `faltas_registradas` e `media_aprovacao` já são armazenados, mas não têm tela de uso.
+- **Histórico de sessões de foco** — as sessões são gravadas, mas só a última encerrada é exibida.
 - **Busca na internet com uma chave real** — a geração usa a ferramenta de busca do Gemini
   (`google_search`). O caminho foi exercitado até a resposta da API, mas o resultado com busca
   ativa só pode ser conferido com uma `GEMINI_API_KEY` válida.

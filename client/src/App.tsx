@@ -4,23 +4,28 @@ import { PaginaInicio } from './paginas/Inicio';
 import { PaginaBlocos } from './paginas/Blocos';
 import { PaginaBloco } from './paginas/Bloco';
 import { JanelaSondagem } from './componentes/JanelaSondagem';
+import { PainelFoco } from './componentes/PainelFoco';
 import { ProvedorSondagem, useSondagem } from './estado/sondagem';
-import { cn } from './util';
+import { ProvedorFoco, useFoco } from './estado/foco';
+import { cn, relogio } from './util';
 import {
   IconeBlocos,
   IconeCalendario,
   IconeCasa,
   IconeGrafico,
   IconeLua,
+  IconeRelogio,
   IconeSol,
 } from './componentes/ui';
 
 export default function App() {
   return (
     <ProvedorSondagem>
-      <BrowserRouter>
-        <Layout />
-      </BrowserRouter>
+      <ProvedorFoco>
+        <BrowserRouter>
+          <Layout />
+        </BrowserRouter>
+      </ProvedorFoco>
     </ProvedorSondagem>
   );
 }
@@ -47,6 +52,7 @@ function Layout() {
         </Routes>
       </main>
       <JanelaSondagem />
+      <PainelFoco />
     </div>
   );
 }
@@ -98,6 +104,8 @@ function BarraLateral() {
 
       <div className="flex-1" />
 
+      <IndicadorFoco />
+
       <button
         className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm font-medium text-zinc-600 transition hover:bg-zinc-200/60 dark:text-zinc-400 dark:hover:bg-zinc-800/60"
         onClick={() => setEscuro((v) => !v)}
@@ -119,5 +127,41 @@ function ItemDesabilitado({ icone, rotulo }: { icone: React.ReactNode; rotulo: s
       {icone}
       {rotulo}
     </span>
+  );
+}
+
+/**
+ * Indicador discreto e persistente da sessão de foco, visível em qualquer
+ * página. Quando não há sessão, vira o botão de iniciar.
+ */
+function IndicadorFoco() {
+  const { sessao, pausado, focadoMs, iniciar, mostrarPainel } = useFoco();
+
+  if (!sessao) {
+    return (
+      <button
+        className="mb-1 flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm font-medium text-zinc-600 transition hover:bg-zinc-200/60 dark:text-zinc-400 dark:hover:bg-zinc-800/60"
+        onClick={() => void iniciar(null)}
+      >
+        <IconeRelogio />
+        Iniciar foco
+      </button>
+    );
+  }
+
+  return (
+    <button
+      className="mb-1 flex w-full items-center gap-2.5 rounded-lg bg-zinc-200/70 px-3 py-2 text-left text-sm transition hover:bg-zinc-200 dark:bg-zinc-800/70 dark:hover:bg-zinc-800"
+      onClick={mostrarPainel}
+      title="Abrir o painel da sessão de foco"
+    >
+      <IconeRelogio className={cn('h-4 w-4 shrink-0', !pausado && 'text-indigo-600 dark:text-indigo-400')} />
+      <span className="min-w-0 flex-1">
+        <span className="block font-medium tabular-nums">{relogio(focadoMs)}</span>
+        <span className="block truncate text-xs text-zinc-500 dark:text-zinc-400">
+          {pausado ? 'Em pausa' : (sessao.bloco_nome ?? 'Sessão de foco')}
+        </span>
+      </span>
+    </button>
   );
 }

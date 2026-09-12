@@ -184,7 +184,7 @@ app.patch(
       b.oculto === undefined ? atual.oculto : bool(b.oculto),
       b.wrapper_academico === undefined ? atual.wrapper_academico : bool(b.wrapper_academico),
       num('limite_faltas'),
-      num('faltas_registradas') ?? 0,
+      Math.max(0, num('faltas_registradas') ?? 0),
       num('media_aprovacao'),
       b.tabela_conteudos_construida === undefined
         ? atual.tabela_conteudos_construida
@@ -1099,6 +1099,195 @@ app.post(
         topico_ids: e.topicos.map((t) => porTitulo.get(t.toLowerCase())).filter(Boolean),
       })),
     });
+  })
+);
+
+// ===========================================================================
+// AVALIACOES (wrapper academico)
+// A nota e um dado academico informado pelo usuario. A plataforma nunca
+// atribui, infere ou gera nota — apenas guarda e faz a aritmetica pedida.
+// ===========================================================================
+app.get(
+  '/api/blocos/:id/avaliacoes',
+  rota((req, res) => {
+    res.json(
+      db
+        .prepare('SELECT * FROM avaliacoes WHERE bloco_id = ? ORDER BY ordem, rowid')
+        .all(req.params.id)
+    );
+  })
+);
+
+// Sincroniza a tabela inteira: a interface e uma grade editavel.
+app.put(
+  '/api/blocos/:id/avaliacoes',
+  rota((req, res) => {
+    const blocoId = req.params.id;
+    if (!db.prepare('SELECT id FROM blocos WHERE id = ?').get(blocoId)) {
+      return res.status(404).json({ erro: 'Bloco não encontrado.' });
+    }
+
+    const recebidas = Array.isArray(req.body?.avaliacoes) ? req.body.avaliacoes : [];
+    const ids = new Set(recebidas.map((a) => a.id));
+
+    const numero = (v) => {
+      if (v === '' || v === null || v === undefined) return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+
+    const sincronizar = db.transaction(() => {
+      for (const { id } of db.prepare('SELECT id FROM avaliacoes WHERE bloco_id = ?').all(blocoId)) {
+        if (!ids.has(id)) db.prepare('DELETE FROM avaliacoes WHERE id = ?').run(id);
+      }
+      const upsert = db.prepare(
+        `INSERT INTO avaliacoes (id, bloco_id, titulo, peso, nota, ordem, data, observacao, criado_em)
+         VALUES (@id, @bloco_id, @titulo, @peso, @nota, @ordem, NULL, NULL, @criado_em)
+         ON CONFLICT(id) DO UPDATE SET
+           titulo = excluded.titulo,
+           peso = excluded.peso,
+           nota = excluded.nota,
+           ordem = excluded.ordem`
+      );
+      recebidas.forEach((a, i) => {
+        upsert.run({
+          id: a.id || novoId(),
+          bloco_id: blocoId,
+          titulo: String(a.titulo || '').trim() || 'Avaliação',
+          peso: numero(a.peso),
+          nota: numero(a.nota),
+          ordem: i,
+          criado_em: agora(),
+        });
+      });
+    });
+    sincronizar();
+
+    res.json(db.prepare('SELECT * FROM avaliacoes WHERE bloco_id = ? ORDER BY ordem, rowid').all(blocoId));
+  })
+);
+
+// ===========================================================================
+// SESSOES DE FOCO
+// Registro voluntario de tempo. Nao ha bloqueio de sites, abas ou aplicativos,
+// nem meta, streak ou comparacao entre dias.
+// ===========================================================================
+app.get(
+  '/api/foco/ativa',
+  rota((_req, res) => {
+    const sessao = db
+      .prepare(
+        `SELECT s.*, b.nome AS bloco_nome FROM sessoes_foco s
+           LEFT JOIN blocos b ON b.id = s.bloco_id
+          WHERE s.fim IS NULL ORDER BY s.inicio DESC LIMIT 1`
+      )
+      .get();
+    res.json(sessao ?? null);
+  })
+);
+
+app.post(
+  '/api/foco/iniciar',
+  rota((req, res) => {
+    // Uma sessao por vez: qualquer sessao aberta e encerrada antes de abrir outra.
+    db.prepare('UPDATE sessoes_foco SET fim = ? WHERE fim IS NULL').run(agora());
+
+    const id = novoId();
+    const blocoId = req.body?.bloco_id || null;
+    db.prepare('INSERT INTO sessoes_foco (id, bloco_id, inicio, fim) VALUES (?,?,?,NULL)').run(
+      id,
+      blocoId,
+      agora()
+    );
+    res.status(201).json(
+      db
+        .prepare(
+          `SELECT s.*, b.nome AS bloco_nome FROM sessoes_foco s
+             LEFT JOIN blocos b ON b.id = s.bloco_id WHERE s.id = ?`
+        )
+        .get(id)
+    );
+  })
+);
+
+app.post(
+  '/api/foco/:id/encerrar',
+  rota((req, res) => {
+    const sessao = db.prepare('SELECT * FROM sessoes_foco WHERE id = ?').get(req.params.id);
+    if (!sessao) return res.status(404).json({ erro: 'Sessão não encontrada.' });
+
+    const fim = sessao.fim ?? agora();
+    db.prepare('UPDATE sessoes_foco SET fim = ? WHERE id = ?').run(fim, sessao.id);
+
+    const decorridoMs = Math.max(0, new Date(fim).getTime() - new Date(sessao.inicio).getTime());
+    res.json({ ...sessao, fim, decorrido_ms: decorridoMs });
+  })
+);
+
+// ===========================================================================
+// COMPROMISSOS DIARIOS
+// Itens nao concluidos de dias anteriores nao sao movidos nem cobrados:
+// cada dia guarda apenas os seus proprios registros.
+// ===========================================================================
+app.get(
+  '/api/compromissos',
+  rota((req, res) => {
+    const data = String(req.query.data || hojeISO()).slice(0, 10);
+    res.json(
+      db.prepare('SELECT * FROM compromissos_diarios WHERE data = ? ORDER BY rowid').all(data)
+    );
+  })
+);
+
+/** Datas que ja tem algum compromisso, para a consulta a dias anteriores. */
+app.get(
+  '/api/compromissos/datas',
+  rota((_req, res) => {
+    res.json(
+      db
+        .prepare('SELECT DISTINCT data FROM compromissos_diarios ORDER BY data DESC LIMIT 60')
+        .all()
+        .map((l) => l.data)
+    );
+  })
+);
+
+app.post(
+  '/api/compromissos',
+  rota((req, res) => {
+    const descricao = String(req.body?.descricao ?? '').trim();
+    if (!descricao) return res.status(400).json({ erro: 'Escreva o compromisso.' });
+    const data = /^\d{4}-\d{2}-\d{2}$/.test(req.body?.data ?? '') ? req.body.data : hojeISO();
+
+    const id = novoId();
+    db.prepare(
+      'INSERT INTO compromissos_diarios (id, data, descricao, concluido) VALUES (?,?,?,0)'
+    ).run(id, data, descricao);
+    res.status(201).json(db.prepare('SELECT * FROM compromissos_diarios WHERE id = ?').get(id));
+  })
+);
+
+app.patch(
+  '/api/compromissos/:id',
+  rota((req, res) => {
+    const atual = db.prepare('SELECT * FROM compromissos_diarios WHERE id = ?').get(req.params.id);
+    if (!atual) return res.status(404).json({ erro: 'Compromisso não encontrado.' });
+    const b = req.body ?? {};
+
+    db.prepare('UPDATE compromissos_diarios SET descricao = ?, concluido = ? WHERE id = ?').run(
+      b.descricao === undefined ? atual.descricao : String(b.descricao).trim() || atual.descricao,
+      b.concluido === undefined ? atual.concluido : bool(b.concluido),
+      atual.id
+    );
+    res.json(db.prepare('SELECT * FROM compromissos_diarios WHERE id = ?').get(atual.id));
+  })
+);
+
+app.delete(
+  '/api/compromissos/:id',
+  rota((req, res) => {
+    db.prepare('DELETE FROM compromissos_diarios WHERE id = ?').run(req.params.id);
+    res.json({ ok: true });
   })
 );
 

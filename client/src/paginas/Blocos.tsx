@@ -1,4 +1,17 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  DndContext,
+  DragOverlay,
+  PointerSensor,
+  pointerWithin,
+  useDraggable,
+  useDroppable,
+  useSensor,
+  useSensors,
+  type CollisionDetection,
+  type DragEndEvent,
+  type DragStartEvent,
+} from '@dnd-kit/core';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import type { Bloco, Pasta } from '../tipos';
@@ -25,6 +38,32 @@ import {
 
 type Filtro = 'todos' | 'favoritos' | 'ocultos';
 type Alvo = { tipo: 'pasta'; dado: Pasta } | { tipo: 'bloco'; dado: Bloco };
+
+/** A própria pasta e todas as suas descendentes — destinos proibidos ao movê-la. */
+function descendentesDe(pastas: Pasta[], pastaId: string) {
+  const proibidos = new Set<string>([pastaId]);
+  let mudou = true;
+  while (mudou) {
+    mudou = false;
+    for (const p of pastas) {
+      if (p.pasta_pai_id && proibidos.has(p.pasta_pai_id) && !proibidos.has(p.id)) {
+        proibidos.add(p.id);
+        mudou = true;
+      }
+    }
+  }
+  return proibidos;
+}
+
+/**
+ * Sob o ponteiro, uma pasta sempre vence a área do nível atual — as duas zonas
+ * se sobrepõem, e sem isso o alvo ficaria ambíguo.
+ */
+const deteccaoDeColisao: CollisionDetection = (args) => {
+  const sob = pointerWithin(args);
+  const pasta = sob.find((c) => String(c.id).startsWith('pasta-'));
+  return pasta ? [pasta] : sob.filter((c) => c.id === 'nivel-atual');
+};
 
 export function PaginaBlocos() {
   const navegar = useNavigate();
@@ -147,6 +186,51 @@ export function PaginaBlocos() {
     e.preventDefault();
     e.stopPropagation();
     setMenu({ x: e.clientX, y: e.clientY, alvo });
+  };
+
+  // --- arrastar e soltar ---------------------------------------------------
+  // O menu de contexto continua sendo o caminho equivalente, e é por ele que a
+  // movimentação funciona pelo teclado.
+  const [arrastando, setArrastando] = useState<Alvo | null>(null);
+
+  // Pequena distância antes de virar arraste, para o clique simples continuar
+  // abrindo o item.
+  const sensores = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
+
+  const proibidos = useMemo(
+    () => (arrastando?.tipo === 'pasta' ? descendentesDe(pastas, arrastando.dado.id) : new Set<string>()),
+    [arrastando, pastas]
+  );
+
+  const aoIniciarArraste = ({ active }: DragStartEvent) => {
+    const id = String(active.id);
+    if (id.startsWith('pasta-')) {
+      const pasta = pastas.find((x) => x.id === id.slice(6));
+      if (pasta) setArrastando({ tipo: 'pasta', dado: pasta });
+    } else {
+      const bloco = blocos.find((x) => x.id === id.slice(6));
+      if (bloco) setArrastando({ tipo: 'bloco', dado: bloco });
+    }
+  };
+
+  const aoSoltar = async ({ active, over }: DragEndEvent) => {
+    const alvo = arrastando;
+    setArrastando(null);
+    if (!alvo || !over) return;
+
+    const idAtivo = String(active.id);
+    // Soltar em área vazia move para o nível atual do breadcrumb.
+    const destino = over.id === 'nivel-atual' ? pastaAtual : String(over.id).slice(6);
+    if (destino === idAtivo.slice(6)) return;
+
+    const atual = alvo.tipo === 'pasta' ? alvo.dado.pasta_pai_id : alvo.dado.pasta_id;
+    if (atual === destino) return;
+    // Uma pasta nunca entra em si mesma nem numa descendente.
+    if (alvo.tipo === 'pasta' && destino !== null && descendentesDe(pastas, alvo.dado.id).has(destino)) return;
+
+    if (alvo.tipo === 'pasta') await api.atualizarPasta(alvo.dado.id, { pasta_pai_id: destino });
+    else await api.atualizarBloco(alvo.dado.id, { pasta_id: destino });
+    await carregar();
   };
 
   return (
@@ -273,10 +357,20 @@ export function PaginaBlocos() {
           }
         />
       ) : (
-        <div className="grid grid-cols-[repeat(auto-fill,minmax(160px,1fr))] gap-3">
+        <DndContext
+          sensors={sensores}
+          collisionDetection={deteccaoDeColisao}
+          onDragStart={aoIniciarArraste}
+          onDragEnd={(e) => void aoSoltar(e)}
+          onDragCancel={() => setArrastando(null)}
+        >
+          <AreaDoNivel>
           {pastasVisiveis.map((p) => (
             <Card
               key={p.id}
+              id={`pasta-${p.id}`}
+              pasta
+              proibido={proibidos.has(p.id)}
               nome={p.nome}
               favorito={p.favorito === 1}
               oculto={p.oculto === 1}
@@ -292,6 +386,7 @@ export function PaginaBlocos() {
           {blocosVisiveis.map((b) => (
             <Card
               key={b.id}
+              id={`bloco-${b.id}`}
               nome={b.nome}
               favorito={b.favorito === 1}
               oculto={b.oculto === 1}
@@ -308,7 +403,22 @@ export function PaginaBlocos() {
               aoMenu={(e) => abrirMenu(e, { tipo: 'bloco', dado: b })}
             />
           ))}
-        </div>
+          </AreaDoNivel>
+
+          {/* Prévia que acompanha o cursor durante o arraste. */}
+          <DragOverlay dropAnimation={null}>
+            {arrastando && (
+              <div className="cartao flex w-40 items-center gap-2 p-3 shadow-xl">
+                {arrastando.tipo === 'pasta' ? (
+                  <IconePasta className="h-5 w-5 shrink-0 text-zinc-400" />
+                ) : (
+                  <IconeBloco className="h-5 w-5 shrink-0 text-zinc-400" />
+                )}
+                <span className="truncate text-sm font-medium">{arrastando.dado.nome}</span>
+              </div>
+            )}
+          </DragOverlay>
+        </DndContext>
       )}
 
       {menu && (
@@ -352,35 +462,74 @@ export function PaginaBlocos() {
 }
 
 // ---------------------------------------------------------------------------
-// Card quadrado
+// Área do nível atual: soltar aqui move o item para a pasta do breadcrumb.
+// ---------------------------------------------------------------------------
+function AreaDoNivel({ children }: { children: React.ReactNode }) {
+  const { setNodeRef, isOver } = useDroppable({ id: 'nivel-atual' });
+  return (
+    <div
+      ref={setNodeRef}
+      className={cn(
+        'grid min-h-40 grid-cols-[repeat(auto-fill,minmax(160px,1fr))] gap-3 rounded-xl p-1 transition',
+        isOver && 'bg-zinc-200/50 dark:bg-zinc-800/40'
+      )}
+    >
+      {children}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Card quadrado — arrastável; pastas também recebem outros itens.
 // ---------------------------------------------------------------------------
 function Card({
+  id,
   nome,
   legenda,
   etiqueta,
   icone,
   favorito,
   oculto,
+  pasta,
+  proibido,
   aoAbrir,
   aoMenu,
 }: {
+  id: string;
   nome: string;
   legenda: string;
   etiqueta?: string;
   icone: React.ReactNode;
   favorito: boolean;
   oculto: boolean;
+  /** Só pastas recebem itens soltos. */
+  pasta?: boolean;
+  /** A própria pasta arrastada e suas descendentes não podem recebê-la. */
+  proibido?: boolean;
   aoAbrir: () => void;
   aoMenu: (e: React.MouseEvent) => void;
 }) {
+  const { setNodeRef: refArraste, listeners, isDragging } = useDraggable({ id });
+  const { setNodeRef: refSolta, isOver } = useDroppable({ id, disabled: !pasta || proibido });
+
+  // A pasta é, ao mesmo tempo, origem de arraste e alvo de soltura.
+  const referencia = (no: HTMLElement | null) => {
+    refArraste(no);
+    if (pasta) refSolta(no);
+  };
+
   return (
-    <button
-      onClick={aoAbrir}
+    <div
+      ref={referencia}
+      {...listeners}
       onContextMenu={aoMenu}
       className={cn(
-        'cartao group relative flex aspect-square flex-col justify-between p-3 text-left transition',
+        'cartao group relative flex aspect-square cursor-grab flex-col justify-between p-3 text-left transition',
         'hover:border-indigo-400 hover:shadow-sm dark:hover:border-indigo-600',
-        oculto && 'opacity-60'
+        oculto && 'opacity-60',
+        isDragging && 'opacity-40',
+        // Destaque da pasta sob o cursor durante o arraste.
+        isOver && 'border-indigo-500 ring-2 ring-indigo-500/40 dark:border-indigo-400'
       )}
     >
       <div className="flex items-start justify-between">
@@ -388,24 +537,24 @@ function Card({
         <span className="flex items-center gap-1">
           {favorito && <IconeEstrela className="h-3.5 w-3.5 text-amber-500" />}
           {oculto && <IconeOlhoCortado className="h-3.5 w-3.5 text-zinc-400" />}
-          <span
-            role="button"
-            tabIndex={0}
-            aria-label="Abrir menu"
+          <button
+            type="button"
+            aria-label={`Abrir menu de ${nome}`}
             onClick={aoMenu}
-            onKeyDown={(e) => e.key === 'Enter' && aoMenu(e as unknown as React.MouseEvent)}
-            className="rounded px-1.5 text-lg leading-none text-zinc-400 opacity-0 transition hover:bg-zinc-200 group-hover:opacity-100 dark:hover:bg-zinc-800"
+            className="rounded px-1.5 text-lg leading-none text-zinc-400 opacity-0 transition hover:bg-zinc-200 focus:opacity-100 group-hover:opacity-100 dark:hover:bg-zinc-800"
           >
             ⋯
-          </span>
+          </button>
         </span>
       </div>
-      <div className="min-w-0">
+
+      {/* Ação principal em um botão de verdade, para o teclado alcançar. */}
+      <button type="button" onClick={aoAbrir} className="min-w-0 text-left">
         {etiqueta && <Etiqueta className="mb-1">{etiqueta}</Etiqueta>}
         <p className="line-clamp-2 text-sm font-medium leading-snug">{nome}</p>
         <p className="mt-0.5 truncate text-xs text-zinc-500 dark:text-zinc-500">{legenda}</p>
-      </div>
-    </button>
+      </button>
+    </div>
   );
 }
 
@@ -645,21 +794,10 @@ function ModalMover({
   }, [alvo]);
 
   // Uma pasta não pode ser movida para dentro de si mesma nem de suas descendentes.
-  const descendentes = useMemo(() => {
-    if (alvo?.tipo !== 'pasta') return new Set<string>();
-    const proibidos = new Set<string>([alvo.dado.id]);
-    let mudou = true;
-    while (mudou) {
-      mudou = false;
-      for (const p of pastas) {
-        if (p.pasta_pai_id && proibidos.has(p.pasta_pai_id) && !proibidos.has(p.id)) {
-          proibidos.add(p.id);
-          mudou = true;
-        }
-      }
-    }
-    return proibidos;
-  }, [alvo, pastas]);
+  const descendentes = useMemo(
+    () => (alvo?.tipo === 'pasta' ? descendentesDe(pastas, alvo.dado.id) : new Set<string>()),
+    [alvo, pastas]
+  );
 
   const opcoes = useMemo(() => {
     const caminho = (p: Pasta): string => {
