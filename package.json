@@ -1,0 +1,17 @@
+{
+  "name": "plataforma-estudos",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -n servidor,cliente -c magenta,cyan \"npm:dev:servidor\" \"npm:dev:cliente\"",
+    "dev:servidor": "npm --prefix server run dev",
+    "dev:cliente": "npm --prefix client run dev",
+    "build": "npm --prefix client run build",
+    "instalar": "npm install && npm --prefix server install && npm --prefix client install",
+    "postinstall": "npm --prefix server install && npm --prefix client install"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
