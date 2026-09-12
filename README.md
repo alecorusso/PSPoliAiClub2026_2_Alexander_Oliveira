@@ -1,10 +1,22 @@
 # Plataforma de Estudos
 
-Plataforma de estudos pessoal, de usuário único, com interface inteiramente em português (pt-BR).
+Plataforma de estudos pessoal, de usuário único.
 
-A ideia central é que a plataforma **registra e organiza, mas nunca avalia**. Todo progresso é
-marcado pelo próprio usuário: não há nota, score nem percentual de domínio — apenas um checklist
-binário, um log qualitativo de evidências e revisões espaçadas. A IA conduz a conversa de sondagem,
+## Resumo da plataforma e UI:
+
+A ideia central da plataforma é dividir o estudo em 3 métodos, baseados em objetivos: Modo de estudo para prova, que consiste no estudo baseado
+na realização de questões nos temas e nos formatos das provas; Modo de estudo para projeto, que consiste no estudo baseado na realização de entregáveis
+e teste contínuo do conhecimento; Modo de estudo para aprendizagem, que consiste no estudo baseado em revisão e sondagem por um agente externo baseado no
+método Feynman.
+
+A plataforma é organizada em blocos de estudo, que representam disciplinas. Eles podem estar associados a disciplinas reais da faculdade ou serem simplesmente assuntos de estudos pessoais. Cada bloco possui uma tabela hierarquizada de tópicos que compõem o bloco de estudo. Existe um opcional para categorizar cada bloco como acadêmico, abrindo funcionalidades como contador de faltas e calculador de média. 
+
+A experiência se organiza em quatro páginas: uma página inicial, que reúne os blocos acessados recentemente, as revisões pendentes do dia e os compromissos diários; a página de blocos, onde eles aparecem no estilo de um explorador de arquivos, podendo ser arrastados entre elas, favoritados, ocultados ou buscados por nome; o calendário, com visão mensal dos eventos, provas, entregas e revisões; e a página de desempenho, que reúne o panorama geral das disciplinas (Não houve tempo para implementar as páginas calendário e acompanhamento de desempenho, portanto estas não estão funcionais).
+
+Dentro de um bloco de estudos, a interface é dominada por um toggle entre os três modos, sempre visível. Um painel lateral mantém o chat com o Gemini (precisa implementar manualmente a chave da API, orientação descrita abaixo), e uma engrenagem dá acesso às configurações, onde ficam as relações com outros blocos, o wrapper acadêmico e a tabela de conteúdos. A sondagem do modo aprendizagem acontece em uma janela flutuante e minimizável, de modo que o usuário possa continuar navegando pela plataforma sem encerrar a sessão nem perder a conversa.
+
+A plataforma registra e organiza, mas nunca avalia. Todo progresso é
+marcado pelo próprio usuário. A IA conduz a conversa de sondagem,
 mas nunca emite veredito nem marca nada.
 
 Como é uma aplicação de usuário único rodando localmente, **não há login, autenticação ou cadastro**.
@@ -75,7 +87,7 @@ O banco fica em `server/dados.db`. Para começar do zero, apague esse arquivo (e
 
 ```env
 GEMINI_API_KEY=sua-chave-aqui
-GEMINI_MODELO=gemini-2.5-flash   # opcional
+GEMINI_MODELO=gemini-3.6-flash   
 PORT=3333                        # opcional
 ```
 
