@@ -1,3 +1,5 @@
+import crypto from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
@@ -9,7 +11,8 @@ dotenv.config({ path: path.join(__dirname, '.env') });
 
 const { default: express } = await import('express');
 const { default: cors } = await import('cors');
-const { db, migrar, agora, hojeISO, somarDias, novoId } = await import('./db.js');
+const { db, migrar, agora, hojeISO, somarDias, novoId, calcularHash, PASTA_ARQUIVOS } =
+  await import('./db.js');
 // Importado depois do dotenv: gemini.js le process.env no carregamento do modulo.
 const {
   conversarSondagem,
@@ -19,25 +22,104 @@ const {
   gerarListaQuestoes,
   gerarGabarito,
   sugerirEntregaveis,
+  estimarTempoTarefa,
+  extrairEventos,
+  decomporRoteiro,
   iaDisponivel,
+  modeloEmUso,
   PROTOCOLOS,
+  embeddingDaConsulta,
 } = await import('./gemini.js');
+const { enfileirar, reindexarBloco, retomarPendentes, precisaIndexar } = await import('./indexacao.js');
+const { selecionarTrechos, textoDaConsulta, paginasDeOrigem } = await import(
+  './recuperacao.js'
+);
+const { materialDoFluxo, materialParaTabela } = await import('./material.js');
+const { default: multer } = await import('multer');
 
 migrar();
 
 const app = express();
 app.use(cors());
+app.use(codigoNasRespostasDeErro);
+// Arquivos chegam por multipart (multer), nunca em JSON: este limite so cobre
+// texto colado e os corpos comuns da API.
 app.use(express.json({ limit: '25mb' }));
+
+// A travessia do grafo mora em client/src/lib/grafo.js e é importada daqui:
+// servidor e cliente compartilham a mesma regra de ciclo e a mesma definição de
+// fusão, em vez de manter duas implementações que podem divergir.
+import {
+  criariaCiclo,
+  fusoesPorResultado,
+  MIN_ORIGENS_FUSAO,
+} from '../client/src/lib/grafo.js';
 
 const PORTA = Number(process.env.PORT) || 3333;
 
-// Envolve um handler assincrono para que erros virem resposta 500 legivel.
-const rota = (fn) => (req, res) => {
-  Promise.resolve(fn(req, res)).catch((e) => {
-    console.error('[erro]', e);
-    if (!res.headersSent) res.status(500).json({ erro: e.message });
-  });
+// Envolve um handler assincrono: qualquer erro segue para o middleware de erro,
+// que sempre responde JSON.
+const rota = (fn) => (req, res, next) => {
+  Promise.resolve(fn(req, res)).catch(next);
 };
+
+// ===========================================================================
+// ERROS SEMPRE EM JSON
+//
+// Nenhuma rota /api pode responder a pagina HTML padrao do Express: a
+// interface le JSON, e um HTML vira "Unexpected token '<'" na tela.
+// ===========================================================================
+
+/** Codigo padrao para respostas de erro que as rotas montam a mao. */
+const CODIGO_POR_STATUS = {
+  400: 'requisicao_invalida',
+  404: 'nao_encontrado',
+  409: 'conflito',
+  413: 'arquivo_grande_demais',
+  500: 'erro_interno',
+};
+
+/**
+ * As rotas respondem { erro } a mao em varios pontos. Aqui toda resposta de
+ * erro ganha tambem o { codigo }, sem precisar tocar em cada uma.
+ */
+function codigoNasRespostasDeErro(_req, res, next) {
+  const json = res.json.bind(res);
+  res.json = (corpo) => {
+    if (res.statusCode >= 400 && corpo && typeof corpo === 'object' && corpo.erro && !corpo.codigo) {
+      corpo = { ...corpo, codigo: CODIGO_POR_STATUS[res.statusCode] ?? `http_${res.statusCode}` };
+    }
+    return json(corpo);
+  };
+  next();
+}
+
+/** Erros de programacao ou do banco: a mensagem crua nao serve ao usuario. */
+const ERROS_TECNICOS = new Set(['SqliteError', 'TypeError', 'ReferenceError', 'SyntaxError', 'RangeError']);
+
+/** Traduz qualquer erro para { status, erro, codigo }. */
+function traduzirErro(err) {
+  if (err?.type === 'entity.too.large' || err?.code === 'LIMIT_FILE_SIZE' || err?.status === 413) {
+    return { status: 413, erro: 'O arquivo é grande demais para o envio atual.', codigo: 'arquivo_grande_demais' };
+  }
+  if (err?.type === 'entity.parse.failed') {
+    return { status: 400, erro: 'O corpo da requisição não é um JSON válido.', codigo: 'json_invalido' };
+  }
+  if (err?.name === 'MulterError') {
+    return { status: 400, erro: 'O envio do arquivo não pôde ser lido.', codigo: 'envio_invalido' };
+  }
+  if (err?.status >= 400 && err?.status < 500 && err?.expose) {
+    return { status: err.status, erro: err.message, codigo: CODIGO_POR_STATUS[err.status] ?? `http_${err.status}` };
+  }
+  const tecnico = !err?.message || ERROS_TECNICOS.has(err?.name);
+  return {
+    status: 500,
+    erro: tecnico
+      ? 'Ocorreu um erro inesperado no servidor. Os detalhes ficaram registrados no console do servidor.'
+      : err.message,
+    codigo: 'erro_interno',
+  };
+}
 
 const bool = (v) => (v ? 1 : 0);
 
@@ -48,7 +130,7 @@ const MODOS = new Set(['prova', 'projeto', 'aprendizagem']);
 // Status
 // ===========================================================================
 app.get('/api/status', (_req, res) => {
-  res.json({ ok: true, ia: iaDisponivel(), protocolos: PROTOCOLOS });
+  res.json({ ok: true, ia: iaDisponivel(), modelo: modeloEmUso(), protocolos: PROTOCOLOS });
 });
 
 // ===========================================================================
@@ -175,7 +257,8 @@ app.patch(
     db.prepare(
       `UPDATE blocos SET nome = ?, descricao = ?, pasta_id = ?, favorito = ?, oculto = ?,
         wrapper_academico = ?, limite_faltas = ?, faltas_registradas = ?, media_aprovacao = ?,
-        tabela_conteudos_construida = ?, sugerir_testes_auto = ? WHERE id = ?`
+        tabela_conteudos_construida = ?, sugerir_testes_auto = ?, formula_media = ?,
+        usar_formula = ? WHERE id = ?`
     ).run(
       b.nome?.trim() || atual.nome,
       b.descricao === undefined ? atual.descricao : b.descricao?.trim() || null,
@@ -190,6 +273,8 @@ app.patch(
         ? atual.tabela_conteudos_construida
         : bool(b.tabela_conteudos_construida),
       b.sugerir_testes_auto === undefined ? atual.sugerir_testes_auto : bool(b.sugerir_testes_auto),
+      b.formula_media === undefined ? atual.formula_media : b.formula_media?.trim() || null,
+      b.usar_formula === undefined ? atual.usar_formula : bool(b.usar_formula),
       atual.id
     );
     res.json(db.prepare('SELECT * FROM blocos WHERE id = ?').get(atual.id));
@@ -246,17 +331,36 @@ app.post(
     if (!['pre_requisito', 'deriva_de', 'fusao_com'].includes(tipo)) {
       return res.status(400).json({ erro: 'Tipo de relação inválido.' });
     }
+    // Fusao tem duas ou mais origens e direcao propria: criar uma aresta solta
+    // aqui produziria uma "fusao" de um participante so.
+    if (tipo === 'fusao_com') {
+      return res.status(400).json({
+        erro: 'Uma fusão é criada pela opção "É fusão de...", com duas ou mais origens.',
+      });
+    }
 
-    // Nunca duplicar a relacao inversa: a aresta existe uma unica vez, em qualquer direcao.
+    // Duplicata e a MESMA aresta, na mesma direcao. A direcao inversa nao e
+    // duplicata: "A e pre-requisito de B" e "B e pre-requisito de A" dizem
+    // coisas diferentes — e a segunda e um ciclo, recusada logo abaixo com a
+    // explicacao certa.
     const jaExiste = db
       .prepare(
-        `SELECT id FROM bloco_relacoes
-          WHERE tipo = ?
-            AND ((bloco_origem_id = ? AND bloco_destino_id = ?)
-              OR (bloco_origem_id = ? AND bloco_destino_id = ?))`
+        'SELECT id FROM bloco_relacoes WHERE tipo = ? AND bloco_origem_id = ? AND bloco_destino_id = ?'
       )
-      .get(tipo, origem, bloco_destino_id, bloco_destino_id, origem);
+      .get(tipo, origem, bloco_destino_id);
     if (jaExiste) return res.status(409).json({ erro: 'Essa relação já existe.' });
+
+    // Uma dependencia circular nao descreve nada que se possa estudar: o bloco
+    // passaria a depender de si mesmo por algum caminho.
+    const arestas = db.prepare('SELECT * FROM bloco_relacoes').all();
+    const nova = { bloco_origem_id: origem, bloco_destino_id: bloco_destino_id, tipo };
+    const ciclo = criariaCiclo(arestas, nova);
+    if (ciclo.ciclo) {
+      const nomeDe = (x) => db.prepare('SELECT nome FROM blocos WHERE id = ?').get(x)?.nome ?? 'o bloco';
+      return res.status(409).json({
+        erro: `Isso criaria um ciclo: ${nomeDe(ciclo.dependencia)} já depende de ${nomeDe(ciclo.dependente)} por outro caminho.`,
+      });
+    }
 
     const id = novoId();
     db.prepare(
@@ -488,51 +592,17 @@ app.post(
 );
 
 // ===========================================================================
-// DOCUMENTOS FONTE
-// ===========================================================================
-app.get(
-  '/api/blocos/:id/documentos',
-  rota((req, res) => {
-    res.json(
-      db
-        .prepare('SELECT id, bloco_id, nome_arquivo, criado_em FROM documentos_fonte WHERE bloco_id = ? ORDER BY criado_em')
-        .all(req.params.id)
-    );
-  })
-);
-
-app.post(
-  '/api/blocos/:id/documentos',
-  rota((req, res) => {
-    const docs = Array.isArray(req.body?.documentos) ? req.body.documentos : [];
-    const inserir = db.prepare(
-      'INSERT INTO documentos_fonte (id, bloco_id, nome_arquivo, conteudo_texto, criado_em) VALUES (?,?,?,?,?)'
-    );
-    const tx = db.transaction(() => {
-      for (const d of docs) {
-        inserir.run(novoId(), req.params.id, d.nome_arquivo || 'documento', d.conteudo_texto || '', agora());
-      }
-    });
-    tx();
-    res.status(201).json({ ok: true, quantidade: docs.length });
-  })
-);
-
-// ===========================================================================
 // IA — todas as chamadas passam pelo servidor
 // ===========================================================================
 app.post(
   '/api/ia/extrair-tabela',
   rota(async (req, res) => {
-    let texto = req.body?.texto;
-    if (!texto && req.body?.bloco_id) {
-      texto = db
-        .prepare('SELECT conteudo_texto FROM documentos_fonte WHERE bloco_id = ? ORDER BY criado_em')
-        .all(req.body.bloco_id)
-        .map((d) => d.conteudo_texto)
-        .join('\n\n---\n\n');
-    }
-    res.json(await extrairTabelaConteudos(texto));
+    // Texto avulso vai como veio; senao o material vem do repositorio do
+    // bloco — os escolhidos, ou todos quando nada foi escolhido.
+    if (req.body?.texto) return res.json(await extrairTabelaConteudos(req.body.texto));
+    if (!req.body?.bloco_id) return res.json(await extrairTabelaConteudos(''));
+    const material = materialParaTabela(req.body.bloco_id, req.body?.documentos_ids);
+    res.json(await extrairTabelaConteudos(material.texto, { estruturado: material.estruturado }));
   })
 );
 
@@ -693,7 +763,9 @@ app.delete(
 // ===========================================================================
 // LISTAS DE QUESTOES
 // ===========================================================================
-const ORIGENS = new Set(['enviada', 'gerada_fontes', 'gerada_internet']);
+// 'gerada_geral': conhecimento geral do modelo, so com confirmacao do usuario
+// quando os documentos nao tratam do topico.
+const ORIGENS = new Set(['enviada', 'gerada_fontes', 'gerada_internet', 'gerada_geral']);
 const STATUS_LISTA = new Set(['nao_feita', 'incompleta', 'completa']);
 
 const SQL_LISTAS = `
@@ -730,8 +802,9 @@ app.post(
     const id = novoId();
     db.prepare(
       `INSERT INTO listas_questoes
-        (id, bloco_id, topico_id, titulo, enunciado, gabarito, origem, status, quantidade, contexto, criado_em)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?)`
+        (id, bloco_id, topico_id, titulo, enunciado, gabarito, origem, status, quantidade, contexto, criado_em,
+         data_prevista, tempo_estimado_min, origem_estimativa, tipo_tarefa, origem_paginas)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     ).run(
       id,
       req.params.id,
@@ -745,7 +818,13 @@ app.post(
       'nao_feita',
       b.quantidade == null ? null : Number(b.quantidade),
       b.contexto === 'projeto' ? 'projeto' : 'prova',
-      agora()
+      agora(),
+      b.data_prevista || null,
+      b.tempo_estimado_min == null || b.tempo_estimado_min === '' ? null : Number(b.tempo_estimado_min),
+      b.origem_estimativa || null,
+      b.tipo_tarefa?.trim() || null,
+      // Paginas de onde a lista gerada saiu, para exibir discretamente.
+      Array.isArray(b.origem_paginas) && b.origem_paginas.length ? JSON.stringify(b.origem_paginas) : null
     );
     res.status(201).json(db.prepare(`${SQL_LISTAS} WHERE l.id = ?`).get(id));
   })
@@ -760,7 +839,15 @@ app.patch(
     const b = req.body ?? {};
     const status = STATUS_LISTA.has(b.status) ? b.status : atual.status;
 
-    db.prepare('UPDATE listas_questoes SET titulo = ?, status = ?, gabarito = ? WHERE id = ?').run(
+    // "completa" e o momento da conclusao; voltar atras limpa a marca.
+    const concluidoEm =
+      status === 'completa' ? (atual.concluido_em ?? agora()) : null;
+
+    db.prepare(
+      `UPDATE listas_questoes SET titulo = ?, status = ?, gabarito = ?, concluido_em = ?,
+        data_prevista = ?, tempo_estimado_min = ?, origem_estimativa = ?, tipo_tarefa = ?
+        WHERE id = ?`
+    ).run(
       b.titulo?.trim() || atual.titulo,
       status,
       b.gabarito === undefined
@@ -770,6 +857,15 @@ app.patch(
           : typeof b.gabarito === 'string'
             ? b.gabarito
             : JSON.stringify(b.gabarito),
+      concluidoEm,
+      b.data_prevista === undefined ? atual.data_prevista : b.data_prevista || null,
+      b.tempo_estimado_min === undefined
+        ? atual.tempo_estimado_min
+        : b.tempo_estimado_min === '' || b.tempo_estimado_min === null
+          ? null
+          : Number(b.tempo_estimado_min),
+      b.origem_estimativa === undefined ? atual.origem_estimativa : b.origem_estimativa || null,
+      b.tipo_tarefa === undefined ? atual.tipo_tarefa : b.tipo_tarefa?.trim() || null,
       atual.id
     );
 
@@ -793,6 +889,12 @@ app.delete(
   '/api/listas/:id',
   rota((req, res) => {
     db.prepare('DELETE FROM listas_questoes WHERE id = ?').run(req.params.id);
+    // Os usos descrevem a lista, nao o documento: some a lista, somem eles.
+    // Excluir um DOCUMENTO e outra coisa — ali a referencia fica, marcada como
+    // removida, para o item gerado continuar dizendo de onde veio.
+    db.prepare("DELETE FROM documento_usos WHERE item_tipo = 'lista_questoes' AND item_id = ?").run(
+      req.params.id
+    );
     res.json({ ok: true });
   })
 );
@@ -848,12 +950,122 @@ function textoDasQuestoes(enunciado) {
 // ===========================================================================
 // IA — listas de questoes
 // ===========================================================================
-function textoDosDocumentos(blocoId, ids) {
-  const todos = db
-    .prepare('SELECT id, conteudo_texto FROM documentos_fonte WHERE bloco_id = ? ORDER BY criado_em')
-    .all(blocoId);
-  const escolhidos = Array.isArray(ids) && ids.length ? todos.filter((d) => ids.includes(d.id)) : todos;
-  return escolhidos.map((d) => d.conteudo_texto).join('\n\n---\n\n');
+
+// ---------------------------------------------------------------------------
+// Recuperacao por topico: a lista e gerada so a partir dos trechos que tratam
+// do topico, nunca do documento inteiro.
+// ---------------------------------------------------------------------------
+const AVISO_SEM_RELEVANCIA = 'Os documentos selecionados não parecem tratar deste tópico.';
+
+/** O topico como consulta: titulo, subtopicos diretos e topico pai. */
+function consultaDoTopico(topico) {
+  const subtopicos = db
+    .prepare('SELECT titulo FROM topicos WHERE topico_pai_id = ? ORDER BY ordem')
+    .all(topico.id)
+    .map((t) => t.titulo);
+  const pai = topico.topico_pai_id
+    ? (db.prepare('SELECT titulo FROM topicos WHERE id = ?').get(topico.topico_pai_id)?.titulo ?? null)
+    : null;
+  return { titulo: topico.titulo, subtopicos, pai };
+}
+
+/**
+ * Trechos dos documentos escolhidos (ou de todos os do bloco) que tratam do
+ * topico. Com todos os trechos indexados e a IA disponivel, a busca e por
+ * embeddings; senao, por palavras-chave (BM25).
+ */
+async function trechosDoTopico(blocoId, documentosIds, topico) {
+  const docs = db
+    .prepare('SELECT id, nome_arquivo, status, sumario FROM documentos_fonte WHERE bloco_id = ?')
+    .all(blocoId)
+    .filter((d) => !documentosIds?.length || documentosIds.includes(d.id));
+  const prontos = docs.filter((d) => (d.status ?? 'pronto') === 'pronto');
+  const base = {
+    trechos: [],
+    relevantes: false,
+    metodo: 'nenhum',
+    semDocumentos: docs.length === 0,
+    processando: docs.filter((d) => d.status === 'processando').map((d) => d.nome_arquivo),
+    nomes: new Map(prontos.map((d) => [d.id, d.nome_arquivo])),
+  };
+  if (prontos.length === 0) return base;
+
+  const ids = prontos.map((d) => d.id);
+  const marcas = ids.map(() => '?').join(',');
+  const linhas = db
+    .prepare(
+      `SELECT id, documento_id, ordem, texto, pagina_inicio, pagina_fim, titulo_secao,
+              embedding IS NOT NULL AS tem_vetor
+         FROM documento_trechos WHERE documento_id IN (${marcas}) ORDER BY documento_id, ordem`
+    )
+    .all(...ids);
+  if (linhas.length === 0) return base;
+
+  const consulta = consultaDoTopico(topico);
+  // A consulta so ganha embedding quando TODOS os trechos tem o seu: comparar
+  // cosseno de uns com BM25 de outros nao faria sentido.
+  let vetor = null;
+  if (iaDisponivel() && linhas.every((l) => l.tem_vetor === 1)) {
+    vetor = await embeddingDaConsulta(textoDaConsulta(consulta));
+  }
+  let vetores = new Map();
+  if (vetor) {
+    vetores = new Map(
+      db
+        .prepare(`SELECT id, embedding FROM documento_trechos WHERE documento_id IN (${marcas})`)
+        .all(...ids)
+        .map((l) => [l.id, JSON.parse(l.embedding)])
+    );
+  }
+
+  const sumarios = new Map(prontos.filter((d) => d.sumario).map((d) => [d.id, JSON.parse(d.sumario)]));
+  const r = selecionarTrechos({
+    trechos: linhas.map((l) => ({ ...l, embedding: vetores.get(l.id) ?? null })),
+    consulta,
+    vetorConsulta: vetor,
+    sumarios,
+  });
+  return {
+    ...base,
+    relevantes: r.relevantes,
+    metodo: r.metodo,
+    trechos: r.selecionados.map((t) => ({
+      id: t.id,
+      documento_id: t.documento_id,
+      nome: base.nomes.get(t.documento_id),
+      texto: t.texto,
+      pagina_inicio: t.pagina_inicio,
+      pagina_fim: t.pagina_fim,
+      titulo_secao: t.titulo_secao,
+    })),
+  };
+}
+
+/**
+ * Troca o rotulo "T3" de cada questao pelo apoio legivel (documento, paginas,
+ * secao) e calcula as paginas de origem da lista a partir dos trechos usados.
+ */
+function aplicarApoio(resultado, trechos, nomes) {
+  const usados = new Set();
+  const questoes = resultado.questoes.map(({ trecho, ...q }) => {
+    const i = /^T(\d+)$/.exec(String(trecho ?? ''))?.[1];
+    const t = i ? trechos[Number(i) - 1] : null;
+    if (!t) return q;
+    usados.add(t);
+    return {
+      ...q,
+      apoio: {
+        documento_id: t.documento_id,
+        nome: t.nome,
+        pagina_inicio: t.pagina_inicio,
+        pagina_fim: t.pagina_fim,
+        titulo_secao: t.titulo_secao,
+      },
+    };
+  });
+  // Sem indicacao do modelo, a origem sao todos os trechos enviados.
+  const base = usados.size ? [...usados] : trechos;
+  return { ...resultado, questoes, origem_paginas: paginasDeOrigem(base, nomes) };
 }
 
 app.post(
@@ -862,13 +1074,39 @@ app.post(
     const { bloco_id, topico_id, quantidade, fonte } = req.body ?? {};
     const topico = db.prepare('SELECT * FROM topicos WHERE id = ?').get(topico_id);
     if (!topico) return res.status(404).json({ erro: 'Tópico não encontrado.' });
+    const consulta = consultaDoTopico(topico);
 
-    const daInternet = fonte?.tipo === 'internet';
-    const entrada = daInternet
-      ? { tipo: 'internet' }
-      : { tipo: 'documentos', texto: textoDosDocumentos(bloco_id, fonte?.documentos_ids) };
+    // Internet, ou conhecimento geral (so depois da confirmacao do usuario).
+    if (fonte?.tipo === 'internet' || fonte?.tipo === 'geral') {
+      const r = await gerarListaQuestoes({ tipo: fonte.tipo }, consulta, quantidade);
+      return res.json({ ...r, origem_paginas: null });
+    }
 
-    res.json(await gerarListaQuestoes(entrada, topico.titulo, quantidade));
+    const rec = await trechosDoTopico(bloco_id, fonte?.documentos_ids, topico);
+    if (rec.semDocumentos) {
+      return res.json({ questoes: [], gabarito: [], erro: 'Este bloco ainda não tem documentos no repositório.' });
+    }
+    if (rec.trechos.length === 0 && rec.processando.length && rec.nomes.size === 0) {
+      return res.json({
+        questoes: [],
+        gabarito: [],
+        erro: 'Os documentos escolhidos ainda estão sendo processados. Assim que ficarem prontos, é só gerar de novo.',
+      });
+    }
+    // Nenhum trecho com relevancia minima: NAO gera questoes fora do topico.
+    if (!rec.relevantes) {
+      return res.json({ questoes: [], gabarito: [], erro: null, sem_relevancia: true, aviso: AVISO_SEM_RELEVANCIA });
+    }
+
+    const r = await gerarListaQuestoes({ tipo: 'documentos', trechos: rec.trechos }, consulta, quantidade);
+    if (r.erro || r.questoes.length === 0) return res.json({ ...r, origem_paginas: null });
+    res.json({
+      ...aplicarApoio(r, rec.trechos, rec.nomes),
+      recuperacao: {
+        metodo: rec.metodo,
+        trechos: rec.trechos.map(({ texto: _t, ...t }) => t),
+      },
+    });
   })
 );
 
@@ -924,8 +1162,9 @@ app.post(
     const id = novoId();
     db.prepare(
       `INSERT INTO entregaveis
-        (id, bloco_id, titulo, descricao, data_entrega, ferramentas, tempo_estimado_horas, concluido, status, criado_em)
-       VALUES (?,?,?,?,?,?,?,0,NULL,?)`
+        (id, bloco_id, titulo, descricao, data_entrega, ferramentas, tempo_estimado_horas, concluido, status, criado_em,
+         origem_estimativa, tipo_tarefa)
+       VALUES (?,?,?,?,?,?,?,0,NULL,?,?,?)`
     ).run(
       id,
       req.params.id,
@@ -934,7 +1173,9 @@ app.post(
       b.data_entrega || null,
       b.ferramentas?.trim() || null,
       b.tempo_estimado_horas === '' || b.tempo_estimado_horas == null ? null : Number(b.tempo_estimado_horas),
-      agora()
+      agora(),
+      b.origem_estimativa || null,
+      b.tipo_tarefa?.trim() || null
     );
     gravarTopicos(id, b.topico_ids);
     res.status(201).json(comTopicos(db.prepare('SELECT * FROM entregaveis WHERE id = ?').get(id)));
@@ -950,7 +1191,7 @@ app.patch(
 
     db.prepare(
       `UPDATE entregaveis SET titulo = ?, descricao = ?, data_entrega = ?, ferramentas = ?,
-        tempo_estimado_horas = ? WHERE id = ?`
+        tempo_estimado_horas = ?, origem_estimativa = ?, tipo_tarefa = ? WHERE id = ?`
     ).run(
       b.titulo?.trim() || atual.titulo,
       b.descricao === undefined ? atual.descricao : b.descricao?.trim() || null,
@@ -961,6 +1202,8 @@ app.patch(
         : b.tempo_estimado_horas === '' || b.tempo_estimado_horas === null
           ? null
           : Number(b.tempo_estimado_horas),
+      b.origem_estimativa === undefined ? atual.origem_estimativa : b.origem_estimativa || null,
+      b.tipo_tarefa === undefined ? atual.tipo_tarefa : b.tipo_tarefa?.trim() || null,
       atual.id
     );
     if (b.topico_ids !== undefined) gravarTopicos(atual.id, b.topico_ids);
@@ -1023,8 +1266,12 @@ app.post(
       return res.json({ ok: true, testes_gerados: [], erro: null });
     }
 
-    const material = textoDosDocumentos(entregavel.bloco_id, null);
-    if (!material.trim()) {
+    const temDocumentos = db
+      .prepare(
+        "SELECT 1 FROM documentos_fonte WHERE bloco_id = ? AND COALESCE(status, 'pronto') = 'pronto' LIMIT 1"
+      )
+      .get(entregavel.bloco_id);
+    if (!temDocumentos) {
       return res.json({
         ok: true,
         testes_gerados: [],
@@ -1041,16 +1288,28 @@ app.post(
     const gerados = [];
     const problemas = [];
     for (const topico of prioritarios) {
-      const r = await gerarListaQuestoes({ tipo: 'documentos', texto: material }, topico.titulo, 5);
-      if (r.erro || r.questoes.length === 0) {
-        problemas.push(`${topico.titulo}: ${r.erro ?? 'sem questões'}`);
+      // Mesma regra das listas: so os trechos do topico vao para o modelo.
+      const rec = await trechosDoTopico(entregavel.bloco_id, null, topico);
+      if (!rec.relevantes) {
+        problemas.push(`${topico.titulo}: ${AVISO_SEM_RELEVANCIA.toLowerCase().replace(/\.$/, '')}`);
         continue;
       }
+      const bruto = await gerarListaQuestoes(
+        { tipo: 'documentos', trechos: rec.trechos },
+        consultaDoTopico(topico),
+        5
+      );
+      if (bruto.erro || bruto.questoes.length === 0) {
+        problemas.push(`${topico.titulo}: ${bruto.erro ?? 'sem questões'}`);
+        continue;
+      }
+      const r = aplicarApoio(bruto, rec.trechos, rec.nomes);
       const id = novoId();
       db.prepare(
         `INSERT INTO listas_questoes
-          (id, bloco_id, topico_id, titulo, enunciado, gabarito, origem, status, quantidade, contexto, criado_em)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?)`
+          (id, bloco_id, topico_id, titulo, enunciado, gabarito, origem, status, quantidade, contexto, criado_em,
+           origem_paginas)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
       ).run(
         id,
         entregavel.bloco_id,
@@ -1062,8 +1321,14 @@ app.post(
         'nao_feita',
         r.questoes.length,
         'projeto',
-        agora()
+        agora(),
+        JSON.stringify(r.origem_paginas)
       );
+      // Procedencia: os documentos de onde o teste saiu.
+      const inserirUso = db.prepare(
+        "INSERT INTO documento_usos (id, documento_id, item_tipo, item_id, criado_em) VALUES (?,?,'lista_questoes',?,?)"
+      );
+      for (const o of r.origem_paginas) inserirUso.run(novoId(), o.documento_id, id, agora());
       gerados.push(db.prepare(`${SQL_LISTAS} WHERE l.id = ?`).get(id));
     }
 
@@ -1140,30 +1405,98 @@ app.put(
       for (const { id } of db.prepare('SELECT id FROM avaliacoes WHERE bloco_id = ?').all(blocoId)) {
         if (!ids.has(id)) db.prepare('DELETE FROM avaliacoes WHERE id = ?').run(id);
       }
+      const anteriores = new Map(
+        db.prepare('SELECT id, nota, concluido_em, feita, realizada FROM avaliacoes WHERE bloco_id = ?')
+          .all(blocoId)
+          .map((a) => [a.id, a])
+      );
       const upsert = db.prepare(
-        `INSERT INTO avaliacoes (id, bloco_id, titulo, peso, nota, ordem, data, observacao, criado_em)
-         VALUES (@id, @bloco_id, @titulo, @peso, @nota, @ordem, NULL, NULL, @criado_em)
+        `INSERT INTO avaliacoes
+           (id, bloco_id, titulo, peso, nota, ordem, data, observacao, criado_em,
+            data_prevista, tempo_estimado_min, origem_estimativa, tipo_tarefa, concluido_em,
+            feita, realizada)
+         VALUES (@id, @bloco_id, @titulo, @peso, @nota, @ordem, NULL, NULL, @criado_em,
+            @data_prevista, @tempo_estimado_min, @origem_estimativa, @tipo_tarefa, @concluido_em,
+            @feita, @realizada)
          ON CONFLICT(id) DO UPDATE SET
            titulo = excluded.titulo,
            peso = excluded.peso,
            nota = excluded.nota,
-           ordem = excluded.ordem`
+           ordem = excluded.ordem,
+           data_prevista = excluded.data_prevista,
+           tempo_estimado_min = excluded.tempo_estimado_min,
+           origem_estimativa = excluded.origem_estimativa,
+           tipo_tarefa = excluded.tipo_tarefa,
+           concluido_em = excluded.concluido_em,
+           feita = excluded.feita,
+           realizada = excluded.realizada`
       );
       recebidas.forEach((a, i) => {
+        const nota = numero(a.nota);
+        const antes = anteriores.get(a.id);
+        // "Feita" e a nota sao coisas diferentes: quem prestou a prova ja a fez,
+        // mesmo sem resultado. Qualquer uma das duas conclui a avaliacao, e a
+        // data da primeira e o que permite medir o tempo real na calibracao.
+        const feita = a.feita === undefined ? (antes?.feita ?? 0) : a.feita ? 1 : 0;
+        // A nota ja e a confirmacao de que a avaliacao aconteceu: preenche-la
+        // liga "realizada" sozinha. Apagar a nota nao desmarca.
+        const realizada =
+          nota !== null ? 1 : a.realizada === undefined ? (antes?.realizada ?? 0) : a.realizada ? 1 : 0;
+        const concluida = nota !== null || feita === 1 || realizada === 1;
+        const concluidoEm = concluida ? (antes?.concluido_em ?? agora()) : null;
+
         upsert.run({
           id: a.id || novoId(),
           bloco_id: blocoId,
           titulo: String(a.titulo || '').trim() || 'Avaliação',
           peso: numero(a.peso),
-          nota: numero(a.nota),
+          nota,
           ordem: i,
           criado_em: agora(),
+          data_prevista: a.data_prevista || null,
+          tempo_estimado_min: numero(a.tempo_estimado_min),
+          origem_estimativa: a.origem_estimativa || null,
+          tipo_tarefa: a.tipo_tarefa?.trim() || null,
+          concluido_em: concluidoEm,
+          feita,
+          realizada,
         });
       });
     });
     sincronizar();
 
     res.json(db.prepare('SELECT * FROM avaliacoes WHERE bloco_id = ? ORDER BY ordem, rowid').all(blocoId));
+  })
+);
+
+// Reagendar e concluir uma avaliacao a partir do cronograma.
+// Reagendar nunca conta como atraso. Concluir marca "feita" e nao inventa nota:
+// a nota continua sendo dado academico informado no painel Academico.
+app.patch(
+  '/api/avaliacoes/:id',
+  rota((req, res) => {
+    const atual = db.prepare('SELECT * FROM avaliacoes WHERE id = ?').get(req.params.id);
+    if (!atual) return res.status(404).json({ erro: 'Avaliação não encontrada.' });
+    const b = req.body ?? {};
+
+    const feita = b.feita === undefined ? atual.feita : b.feita ? 1 : 0;
+    // "Realizada" diz que a prova foi feita e a nota ainda nao saiu. Com nota,
+    // e sempre 1: a nota ja confirma que aconteceu.
+    const realizada =
+      atual.nota !== null ? 1 : b.realizada === undefined ? atual.realizada : b.realizada ? 1 : 0;
+    const concluida = atual.nota !== null || feita === 1 || realizada === 1;
+    const concluidoEm = concluida ? (atual.concluido_em ?? agora()) : null;
+
+    db.prepare(
+      'UPDATE avaliacoes SET data_prevista = ?, feita = ?, realizada = ?, concluido_em = ? WHERE id = ?'
+    ).run(
+      b.data_prevista === undefined ? atual.data_prevista : b.data_prevista || null,
+      feita,
+      realizada,
+      concluidoEm,
+      atual.id
+    );
+    res.json(db.prepare('SELECT * FROM avaliacoes WHERE id = ?').get(atual.id));
   })
 );
 
@@ -1291,7 +1624,1380 @@ app.delete(
   })
 );
 
+// ===========================================================================
+// CONFIG — preferencias simples da plataforma
+// ===========================================================================
+const CONFIG_PADRAO = { orcamento_diario_min: '240' };
+
+function lerConfig() {
+  const linhas = db.prepare('SELECT chave, valor FROM config').all();
+  return { ...CONFIG_PADRAO, ...Object.fromEntries(linhas.map((l) => [l.chave, l.valor])) };
+}
+
+app.get(
+  '/api/config',
+  rota((_req, res) => res.json(lerConfig()))
+);
+
+app.patch(
+  '/api/config',
+  rota((req, res) => {
+    const gravar = db.prepare(
+      'INSERT INTO config (chave, valor) VALUES (?,?) ON CONFLICT(chave) DO UPDATE SET valor = excluded.valor'
+    );
+    const tx = db.transaction(() => {
+      for (const [chave, valor] of Object.entries(req.body ?? {})) {
+        if (typeof chave === 'string' && chave) gravar.run(chave, String(valor));
+      }
+    });
+    tx();
+    res.json(lerConfig());
+  })
+);
+
+// ===========================================================================
+// TIPOS DE TAREFA — autocomplete a partir do que o usuario ja usou
+// Evita que cada item vire um tipo novo por variacao de escrita.
+// ===========================================================================
+app.get(
+  '/api/tipos-tarefa',
+  rota((_req, res) => {
+    const linhas = db
+      .prepare(
+        `SELECT tipo_tarefa AS tipo, COUNT(*) AS usos FROM (
+           SELECT tipo_tarefa FROM entregaveis WHERE tipo_tarefa IS NOT NULL AND TRIM(tipo_tarefa) <> ''
+           UNION ALL
+           SELECT tipo_tarefa FROM listas_questoes WHERE tipo_tarefa IS NOT NULL AND TRIM(tipo_tarefa) <> ''
+           UNION ALL
+           SELECT tipo_tarefa FROM avaliacoes WHERE tipo_tarefa IS NOT NULL AND TRIM(tipo_tarefa) <> ''
+         ) GROUP BY tipo_tarefa ORDER BY usos DESC, tipo_tarefa`
+      )
+      .all();
+    res.json(linhas.map((l) => l.tipo));
+  })
+);
+
+// ===========================================================================
+// IA — estimativa de tempo
+// ===========================================================================
+app.post(
+  '/api/ia/estimar-tempo',
+  rota(async (req, res) => {
+    const { descricao, tipo, contexto } = req.body ?? {};
+    res.json(await estimarTempoTarefa(descricao, tipo, contexto));
+  })
+);
+
+// ===========================================================================
+// AJUSTES MANUAIS DE PRIORIDADE
+// Guardam a intencao do usuario; a fila e remontada com eles aplicados.
+// ===========================================================================
+const DIRECOES = new Set(['promover', 'rebaixar']);
+
+app.put(
+  '/api/ajustes-prioridade',
+  rota((req, res) => {
+    const { item_tipo, item_id, direcao, magnitude } = req.body ?? {};
+    if (!item_tipo || !item_id) return res.status(400).json({ erro: 'Item inválido.' });
+    if (!DIRECOES.has(direcao)) return res.status(400).json({ erro: 'Direção inválida.' });
+
+    db.prepare('DELETE FROM ajustes_prioridade WHERE item_tipo = ? AND item_id = ?').run(item_tipo, item_id);
+    const id = novoId();
+    db.prepare(
+      'INSERT INTO ajustes_prioridade (id, item_tipo, item_id, direcao, magnitude, criado_em) VALUES (?,?,?,?,?,?)'
+    ).run(id, item_tipo, item_id, direcao, Math.max(0, Number(magnitude) || 0), agora());
+    res.json(db.prepare('SELECT * FROM ajustes_prioridade WHERE id = ?').get(id));
+  })
+);
+
+app.delete(
+  '/api/ajustes-prioridade/:tipo/:id',
+  rota((req, res) => {
+    db.prepare('DELETE FROM ajustes_prioridade WHERE item_tipo = ? AND item_id = ?').run(
+      req.params.tipo,
+      req.params.id
+    );
+    res.json({ ok: true });
+  })
+);
+
+// ===========================================================================
+// CRONOGRAMA — dados crus para a pipeline do cliente
+// O calculo de prioridade mora em client/src/lib/cronograma.ts; aqui so se
+// reune o que ele precisa, numa unica ida ao servidor.
+// ===========================================================================
+app.get(
+  '/api/cronograma',
+  rota((_req, res) => {
+    const entregaveis = db
+      .prepare(
+        `SELECT e.id, e.bloco_id, b.nome AS bloco_nome, e.titulo, e.data_entrega,
+                e.tempo_estimado_horas, e.concluido, e.tipo_tarefa, e.origem_estimativa, e.criado_em
+           FROM entregaveis e JOIN blocos b ON b.id = e.bloco_id`
+      )
+      .all();
+
+    const listas = db
+      .prepare(
+        `SELECT l.id, l.bloco_id, b.nome AS bloco_nome, l.titulo, l.data_prevista,
+                l.tempo_estimado_min, l.status, l.contexto, l.tipo_tarefa, l.origem_estimativa, l.criado_em
+           FROM listas_questoes l JOIN blocos b ON b.id = l.bloco_id`
+      )
+      .all();
+
+    const avaliacoes = db
+      .prepare(
+        `SELECT a.id, a.bloco_id, b.nome AS bloco_nome, a.titulo, a.data_prevista,
+                a.tempo_estimado_min, a.nota, a.feita, a.realizada, a.tipo_tarefa,
+                a.origem_estimativa, a.criado_em
+           FROM avaliacoes a JOIN blocos b ON b.id = a.bloco_id`
+      )
+      .all();
+
+    const revisoes = db
+      .prepare(
+        `SELECT r.id, r.numero, r.data_prevista, r.status, r.topico_id,
+                t.titulo AS topico_titulo, t.peso AS topico_peso,
+                t.bloco_id, b.nome AS bloco_nome
+           FROM revisoes r
+           JOIN topicos t ON t.id = r.topico_id
+           JOIN blocos b ON b.id = t.bloco_id
+          WHERE r.status != 'concluida'`
+      )
+      .all();
+
+    // Historico da calibracao: so itens concluidos cuja estimativa veio do
+    // proprio usuario ('faixa' ou 'exata'). Estimativa da IA nao entra, porque
+    // mediria o erro do modelo e nao o de quem estuda.
+    const historico = db
+      .prepare(
+        `SELECT tipo_tarefa, tempo_estimado_min, criado_em, concluido_em FROM (
+           SELECT tipo_tarefa, CAST(tempo_estimado_horas * 60 AS INTEGER) AS tempo_estimado_min,
+                  criado_em, concluido_em, origem_estimativa
+             FROM entregaveis
+            WHERE concluido = 1 AND concluido_em IS NOT NULL AND tempo_estimado_horas IS NOT NULL
+           UNION ALL
+           SELECT tipo_tarefa, tempo_estimado_min, criado_em, concluido_em, origem_estimativa
+             FROM listas_questoes
+            WHERE status = 'completa' AND concluido_em IS NOT NULL AND tempo_estimado_min IS NOT NULL
+           UNION ALL
+           SELECT tipo_tarefa, tempo_estimado_min, criado_em, concluido_em, origem_estimativa
+             FROM avaliacoes
+            WHERE concluido_em IS NOT NULL AND tempo_estimado_min IS NOT NULL
+         ) WHERE origem_estimativa IN ('faixa','exata')`
+      )
+      .all();
+
+    res.json({
+      hoje: hojeISO(),
+      config: lerConfig(),
+      entregaveis,
+      listas,
+      avaliacoes,
+      revisoes,
+      historico,
+      ajustes: db.prepare('SELECT * FROM ajustes_prioridade').all(),
+      // Quais atividades realizam cada avaliacao: e o que evita contar o mesmo
+      // trabalho duas vezes na fila.
+      vinculos: db.prepare('SELECT * FROM avaliacao_itens').all(),
+    });
+  })
+);
+
+// ===========================================================================
+// CALENDARIO
+// Cinco origens num payload so. O calendario e uma leitura do que ja existe:
+// nada aqui cria um segundo registro para o mesmo objetivo de estudo.
+// ===========================================================================
+const TIPOS_EVENTO = new Set(['prova', 'aula', 'entrega', 'outro']);
+
+/** A que avaliacao um item pertence, para o calendario mostrar o vinculo. */
+function avaliacaoDoItem(tipo, id) {
+  return (
+    db
+      .prepare(
+        `SELECT a.id, a.titulo FROM avaliacao_itens v
+           JOIN avaliacoes a ON a.id = v.avaliacao_id
+          WHERE v.item_tipo = ? AND v.item_id = ?`
+      )
+      .get(tipo, id) ?? null
+  );
+}
+
+/** Uma prova de disciplina e a avaliacao do bloco, nunca um evento a parte. */
+function ehProvaDeDisciplina(tipo, blocoId) {
+  if (tipo !== 'prova' || !blocoId) return false;
+  const b = db.prepare('SELECT wrapper_academico FROM blocos WHERE id = ?').get(blocoId);
+  return Boolean(b && b.wrapper_academico === 1);
+}
+
+app.get(
+  '/api/calendario',
+  rota((req, res) => {
+    // Sem intervalo, devolve tudo: o volume de um usuario unico e pequeno e a
+    // navegacao entre meses fica instantanea.
+    const de = String(req.query.de || '0000-01-01');
+    const ate = String(req.query.ate || '9999-12-31');
+    const faixa = [de, ate];
+
+    const itens = [];
+
+    for (const e of db
+      .prepare(
+        `SELECT e.*, b.nome AS bloco_nome FROM eventos e
+           LEFT JOIN blocos b ON b.id = e.bloco_id
+          WHERE e.data_inicio IS NOT NULL AND e.data_inicio BETWEEN ? AND ?`
+      )
+      .all(...faixa)) {
+      itens.push({
+        tipo: 'evento',
+        id: e.id,
+        titulo: e.titulo,
+        data: e.data_inicio,
+        bloco_id: e.bloco_id,
+        bloco_nome: e.bloco_nome,
+        concluido: 0,
+        detalhe: { tipo_evento: e.tipo, data_fim: e.data_fim, observacao: e.observacao },
+      });
+    }
+
+    for (const a of db
+      .prepare(
+        `SELECT a.*, b.nome AS bloco_nome FROM avaliacoes a
+           JOIN blocos b ON b.id = a.bloco_id
+          WHERE a.data_prevista IS NOT NULL AND a.data_prevista BETWEEN ? AND ?`
+      )
+      .all(...faixa)) {
+      itens.push({
+        tipo: 'avaliacao',
+        id: a.id,
+        titulo: a.titulo,
+        data: a.data_prevista,
+        bloco_id: a.bloco_id,
+        bloco_nome: a.bloco_nome,
+        concluido: a.nota !== null || a.feita === 1 || a.realizada === 1 ? 1 : 0,
+        detalhe: {
+          nota: a.nota,
+          feita: a.feita,
+          realizada: a.realizada,
+          // Itens que realizam esta avaliação, para o destaque no calendário.
+          itens_vinculados: db
+            .prepare('SELECT item_tipo, item_id FROM avaliacao_itens WHERE avaliacao_id = ?')
+            .all(a.id),
+          peso: a.peso,
+          tempo_estimado_min: a.tempo_estimado_min,
+          origem_estimativa: a.origem_estimativa,
+          tipo_tarefa: a.tipo_tarefa,
+        },
+      });
+    }
+
+    for (const e of db
+      .prepare(
+        `SELECT e.*, b.nome AS bloco_nome FROM entregaveis e
+           JOIN blocos b ON b.id = e.bloco_id
+          WHERE e.data_entrega IS NOT NULL AND e.data_entrega BETWEEN ? AND ?`
+      )
+      .all(...faixa)) {
+      itens.push({
+        tipo: 'entregavel',
+        id: e.id,
+        titulo: e.titulo,
+        data: e.data_entrega,
+        bloco_id: e.bloco_id,
+        bloco_nome: e.bloco_nome,
+        concluido: e.concluido === 1 ? 1 : 0,
+        detalhe: {
+          descricao: e.descricao,
+          tempo_estimado_horas: e.tempo_estimado_horas,
+          avaliacao: avaliacaoDoItem('entregavel', e.id),
+        },
+      });
+    }
+
+    for (const l of db
+      .prepare(
+        `SELECT l.*, b.nome AS bloco_nome FROM listas_questoes l
+           JOIN blocos b ON b.id = l.bloco_id
+          WHERE l.data_prevista IS NOT NULL AND l.data_prevista BETWEEN ? AND ?`
+      )
+      .all(...faixa)) {
+      itens.push({
+        tipo: 'lista',
+        id: l.id,
+        titulo: l.titulo,
+        data: l.data_prevista,
+        bloco_id: l.bloco_id,
+        bloco_nome: l.bloco_nome,
+        concluido: l.status === 'completa' ? 1 : 0,
+        detalhe: {
+          status: l.status,
+          contexto: l.contexto,
+          tempo_estimado_min: l.tempo_estimado_min,
+          avaliacao: avaliacaoDoItem('lista_questoes', l.id),
+        },
+      });
+    }
+
+    for (const r of db
+      .prepare(
+        `SELECT r.*, t.titulo AS topico_titulo, t.bloco_id, b.nome AS bloco_nome
+           FROM revisoes r
+           JOIN topicos t ON t.id = r.topico_id
+           JOIN blocos b ON b.id = t.bloco_id
+          WHERE r.data_prevista IS NOT NULL AND r.data_prevista BETWEEN ? AND ?`
+      )
+      .all(...faixa)) {
+      itens.push({
+        tipo: 'revisao',
+        id: r.id,
+        titulo: r.topico_titulo,
+        data: r.data_prevista,
+        bloco_id: r.bloco_id,
+        bloco_nome: r.bloco_nome,
+        concluido: r.status === 'concluida' ? 1 : 0,
+        detalhe: { numero: r.numero, status: r.status, topico_id: r.topico_id },
+      });
+    }
+
+    itens.sort((a, b) => a.data.localeCompare(b.data) || a.titulo.localeCompare(b.titulo, 'pt-BR'));
+    res.json({ hoje: hojeISO(), itens });
+  })
+);
+
+// ===========================================================================
+// EVENTOS
+// ===========================================================================
+app.post(
+  '/api/eventos',
+  rota((req, res) => {
+    const b = req.body ?? {};
+    const titulo = String(b.titulo || '').trim();
+    if (!titulo) return res.status(400).json({ erro: 'Informe o nome.' });
+    const tipo = TIPOS_EVENTO.has(b.tipo) ? b.tipo : 'outro';
+    const blocoId = b.bloco_id || null;
+
+    // Prova de disciplina nasce como avaliacao do bloco: um registro so, que
+    // aparece no wrapper, no calendario e no cronograma.
+    if (ehProvaDeDisciplina(tipo, blocoId)) {
+      const id = novoId();
+      const ordem = db
+        .prepare('SELECT COALESCE(MAX(ordem), -1) + 1 AS proxima FROM avaliacoes WHERE bloco_id = ?')
+        .get(blocoId).proxima;
+      const numero = (v) => {
+        if (v === '' || v === null || v === undefined) return null;
+        const n = Number(v);
+        return Number.isFinite(n) ? n : null;
+      };
+      db.prepare(
+        `INSERT INTO avaliacoes
+           (id, bloco_id, titulo, peso, nota, ordem, data, observacao, criado_em,
+            data_prevista, tempo_estimado_min, origem_estimativa, tipo_tarefa, concluido_em, feita)
+         VALUES (?,?,?,?,NULL,?,NULL,?,?,?,?,?,?,NULL,0)`
+      ).run(
+        id,
+        blocoId,
+        titulo,
+        numero(b.peso),
+        ordem,
+        b.observacao?.trim() || null,
+        agora(),
+        b.data_inicio || null,
+        numero(b.tempo_estimado_min),
+        b.origem_estimativa || null,
+        b.tipo_tarefa?.trim() || 'prova'
+      );
+      return res.status(201).json({
+        criado: 'avaliacao',
+        avaliacao: db.prepare('SELECT * FROM avaliacoes WHERE id = ?').get(id),
+      });
+    }
+
+    const id = novoId();
+    db.prepare(
+      'INSERT INTO eventos (id, bloco_id, titulo, tipo, data_inicio, data_fim, observacao, criado_em) VALUES (?,?,?,?,?,?,?,?)'
+    ).run(
+      id,
+      blocoId,
+      titulo,
+      tipo,
+      b.data_inicio || null,
+      b.data_fim || null,
+      b.observacao?.trim() || null,
+      agora()
+    );
+    res.status(201).json({
+      criado: 'evento',
+      evento: db.prepare('SELECT * FROM eventos WHERE id = ?').get(id),
+    });
+  })
+);
+
+app.patch(
+  '/api/eventos/:id',
+  rota((req, res) => {
+    const atual = db.prepare('SELECT * FROM eventos WHERE id = ?').get(req.params.id);
+    if (!atual) return res.status(404).json({ erro: 'Evento não encontrado.' });
+    const b = req.body ?? {};
+    // Reagendar e so mover a data. Nunca conta como atraso.
+    db.prepare(
+      'UPDATE eventos SET titulo = ?, tipo = ?, data_inicio = ?, data_fim = ?, observacao = ? WHERE id = ?'
+    ).run(
+      b.titulo === undefined ? atual.titulo : String(b.titulo).trim() || atual.titulo,
+      b.tipo !== undefined && TIPOS_EVENTO.has(b.tipo) ? b.tipo : atual.tipo,
+      b.data_inicio === undefined ? atual.data_inicio : b.data_inicio || null,
+      b.data_fim === undefined ? atual.data_fim : b.data_fim || null,
+      b.observacao === undefined ? atual.observacao : b.observacao?.trim() || null,
+      atual.id
+    );
+    res.json(db.prepare('SELECT * FROM eventos WHERE id = ?').get(atual.id));
+  })
+);
+
+app.delete(
+  '/api/eventos/:id',
+  rota((req, res) => {
+    db.prepare('DELETE FROM eventos WHERE id = ?').run(req.params.id);
+    res.json({ ok: true });
+  })
+);
+
+// ===========================================================================
+// DESEMPENHO
+// Dados crus para a pagina de desempenho. A agregacao mora em
+// client/src/lib/desempenho.ts; aqui so se reune o que ela precisa.
+//
+// Evidencias de aprendizagem NAO entram: sao log qualitativo e nunca viram
+// metrica. Revisoes entram apenas como contagem de organizacao, nunca no
+// grafico de cumprimento do plano.
+// ===========================================================================
+app.get(
+  '/api/desempenho',
+  rota((_req, res) => {
+    const blocos = db
+      .prepare(
+        `SELECT id, nome, wrapper_academico, limite_faltas, faltas_registradas,
+                media_aprovacao, formula_media, usar_formula
+           FROM blocos ORDER BY nome`
+      )
+      .all();
+
+    // Itens concluidos que tinham data. "data_vigente" e a data ATUAL do item,
+    // ja com qualquer reagendamento aplicado: e por isso que reagendar nunca
+    // aparece como atraso.
+    const metas = db
+      .prepare(
+        `SELECT 'avaliacao' AS tipo, id, bloco_id, titulo, data_prevista AS data_vigente, concluido_em
+           FROM avaliacoes
+          WHERE concluido_em IS NOT NULL AND data_prevista IS NOT NULL
+         UNION ALL
+         SELECT 'entregavel' AS tipo, id, bloco_id, titulo, data_entrega AS data_vigente, concluido_em
+           FROM entregaveis
+          WHERE concluido = 1 AND concluido_em IS NOT NULL AND data_entrega IS NOT NULL
+         UNION ALL
+         SELECT 'lista' AS tipo, id, bloco_id, titulo, data_prevista AS data_vigente, concluido_em
+           FROM listas_questoes
+          WHERE status = 'completa' AND concluido_em IS NOT NULL AND data_prevista IS NOT NULL`
+      )
+      .all();
+
+    // Notas sao dado academico informado pelo usuario: a plataforma exibe, nunca gera.
+    const avaliacoes = db
+      .prepare('SELECT id, bloco_id, titulo, peso, nota FROM avaliacoes ORDER BY bloco_id, ordem, rowid')
+      .all();
+
+    // Mesmo filtro da calibracao: so estimativa do proprio usuario.
+    const calibracao = db
+      .prepare(
+        `SELECT bloco_id, tipo_tarefa, tempo_estimado_min, criado_em, concluido_em FROM (
+           SELECT bloco_id, tipo_tarefa, CAST(tempo_estimado_horas * 60 AS INTEGER) AS tempo_estimado_min,
+                  criado_em, concluido_em, origem_estimativa
+             FROM entregaveis
+            WHERE concluido = 1 AND concluido_em IS NOT NULL AND tempo_estimado_horas IS NOT NULL
+           UNION ALL
+           SELECT bloco_id, tipo_tarefa, tempo_estimado_min, criado_em, concluido_em, origem_estimativa
+             FROM listas_questoes
+            WHERE status = 'completa' AND concluido_em IS NOT NULL AND tempo_estimado_min IS NOT NULL
+           UNION ALL
+           SELECT bloco_id, tipo_tarefa, tempo_estimado_min, criado_em, concluido_em, origem_estimativa
+             FROM avaliacoes
+            WHERE concluido_em IS NOT NULL AND tempo_estimado_min IS NOT NULL
+         ) WHERE origem_estimativa IN ('faixa','exata')`
+      )
+      .all();
+
+    // So o acumulado. Nenhuma serie temporal, nenhuma comparacao entre periodos.
+    const foco = db
+      .prepare('SELECT bloco_id, inicio, fim FROM sessoes_foco WHERE fim IS NOT NULL')
+      .all();
+
+    const revisoes = db
+      .prepare(
+        `SELECT r.id, r.status, r.data_prevista, t.bloco_id
+           FROM revisoes r JOIN topicos t ON t.id = r.topico_id`
+      )
+      .all();
+
+    res.json({ hoje: hojeISO(), blocos, metas, avaliacoes, calibracao, foco, revisoes });
+  })
+);
+
+// ===========================================================================
+// FUSAO
+// Um bloco RESULTADO e a fusao de DUAS OU MAIS ORIGENS. As arestas 'fusao_com'
+// vao sempre da origem para o resultado, e o conjunto de arestas que aponta
+// para o mesmo resultado E a fusao — por isso um bloco e resultado de no
+// maximo uma fusao, por construcao.
+// ===========================================================================
+const todasAsArestas = () => db.prepare('SELECT * FROM bloco_relacoes').all();
+
+const nomeDoBloco = (id) => db.prepare('SELECT nome FROM blocos WHERE id = ?').get(id)?.nome ?? '';
+
+app.get(
+  '/api/blocos/:id/fusao',
+  rota((req, res) => {
+    const id = req.params.id;
+    const fusoes = fusoesPorResultado(todasAsArestas());
+    const comNome = (blocoId) => ({ id: blocoId, nome: nomeDoBloco(blocoId) });
+
+    // Este bloco e resultado de uma fusao?
+    const origens = fusoes.get(id) ?? null;
+
+    // Este bloco e origem de quais fusoes?
+    const comoOrigem = [];
+    for (const [resultado, lista] of fusoes) {
+      if (resultado === id || !lista.includes(id)) continue;
+      comoOrigem.push({
+        resultado: comNome(resultado),
+        outras: lista.filter((o) => o !== id).map(comNome),
+      });
+    }
+
+    res.json({
+      resultado: origens ? { origens: origens.map(comNome) } : null,
+      comoOrigem,
+    });
+  })
+);
+
+app.put(
+  '/api/blocos/:id/fusao',
+  rota((req, res) => {
+    const resultado = req.params.id;
+    if (!db.prepare('SELECT id FROM blocos WHERE id = ?').get(resultado)) {
+      return res.status(404).json({ erro: 'Bloco não encontrado.' });
+    }
+
+    const pedidas = Array.isArray(req.body?.origens) ? req.body.origens : [];
+    const origens = [...new Set(pedidas.filter((o) => typeof o === 'string' && o))];
+
+    // Um bloco nao pode ser origem da fusao que resulta nele mesmo.
+    if (origens.includes(resultado)) {
+      return res
+        .status(400)
+        .json({ erro: 'Um bloco não pode ser origem da fusão que resulta nele mesmo.' });
+    }
+    if (origens.length < MIN_ORIGENS_FUSAO) {
+      return res
+        .status(400)
+        .json({ erro: `Uma fusão precisa de pelo menos ${MIN_ORIGENS_FUSAO} blocos de origem.` });
+    }
+    const existentes = db
+      .prepare(`SELECT id FROM blocos WHERE id IN (${origens.map(() => '?').join(',')})`)
+      .all(...origens);
+    if (existentes.length !== origens.length) {
+      return res.status(400).json({ erro: 'Algum bloco de origem não existe mais.' });
+    }
+
+    // Substitui a fusao inteira: o conjunto de origens e o que define a fusao.
+    const apagar = db.prepare(
+      "DELETE FROM bloco_relacoes WHERE tipo = 'fusao_com' AND bloco_destino_id = ?"
+    );
+    const inserir = db.prepare(
+      "INSERT INTO bloco_relacoes (id, bloco_origem_id, bloco_destino_id, tipo, migrada) VALUES (?,?,?,'fusao_com',1)"
+    );
+    db.transaction(() => {
+      apagar.run(resultado);
+      for (const o of origens) inserir.run(novoId(), o, resultado);
+    })();
+
+    res.json({ ok: true, origens: origens.length });
+  })
+);
+
+app.delete(
+  '/api/blocos/:id/fusao',
+  rota((req, res) => {
+    db.prepare("DELETE FROM bloco_relacoes WHERE tipo = 'fusao_com' AND bloco_destino_id = ?").run(
+      req.params.id
+    );
+    res.json({ ok: true });
+  })
+);
+
+// ===========================================================================
+// GRAFO DOS BLOCOS
+// ===========================================================================
+app.get(
+  '/api/grafo',
+  rota((_req, res) => {
+    const blocos = db
+      .prepare(
+        `SELECT id, nome, pasta_id, favorito, oculto, wrapper_academico, pos_x, pos_y, ultimo_acesso
+           FROM blocos ORDER BY nome`
+      )
+      .all();
+    res.json({ blocos, relacoes: todasAsArestas(), config: lerConfig() });
+  })
+);
+
+/** Arrastar um no so move o bloco. Nunca cria nem altera relacao. */
+app.patch(
+  '/api/blocos/:id/posicao',
+  rota((req, res) => {
+    const { pos_x, pos_y } = req.body ?? {};
+    const numero = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+    db.prepare('UPDATE blocos SET pos_x = ?, pos_y = ? WHERE id = ?').run(
+      numero(pos_x),
+      numero(pos_y),
+      req.params.id
+    );
+    res.json({ ok: true });
+  })
+);
+
+/** Grava varias posicoes de uma vez: primeiro layout e "Reorganizar mapa". */
+app.put(
+  '/api/grafo/posicoes',
+  rota((req, res) => {
+    const posicoes = Array.isArray(req.body?.posicoes) ? req.body.posicoes : [];
+    const gravar = db.prepare('UPDATE blocos SET pos_x = ?, pos_y = ? WHERE id = ?');
+    db.transaction(() => {
+      for (const p of posicoes) {
+        if (!p?.id) continue;
+        gravar.run(Number(p.pos_x) || 0, Number(p.pos_y) || 0, p.id);
+      }
+    })();
+    res.json({ ok: true, gravadas: posicoes.length });
+  })
+);
+
+
+// IA — extracao de eventos de um documento. A IA propoe; nada e gravado aqui:
+// o cliente leva a lista para a tela de revisao, e so o que o usuario confirmar
+// vira registro.
+app.post(
+  '/api/ia/extrair-eventos',
+  rota(async (req, res) => {
+    const { texto, inicio_periodo, bloco_id, incluir_aulas, documentos_ids } = req.body ?? {};
+    const bloco = bloco_id ? db.prepare('SELECT nome FROM blocos WHERE id = ?').get(bloco_id) : null;
+    // O texto pode vir colado ou dos documentos escolhidos no repositório.
+    const conteudo =
+      texto ||
+      (bloco_id && documentos_ids?.length
+        ? materialDoFluxo('importacao_calendario', bloco_id, documentos_ids).texto
+        : texto);
+    res.json(
+      await extrairEventos(conteudo, {
+        hoje: hojeISO(),
+        inicio_periodo: inicio_periodo || null,
+        bloco_nome: bloco?.nome ?? null,
+        incluir_aulas: Boolean(incluir_aulas),
+      })
+    );
+  })
+);
+
+
+// IA — decomposicao de um roteiro de projeto em entregaveis. Nada e gravado
+// aqui: a proposta vai para a tela de revisao, e as datas sao calculadas pelo
+// cliente, nunca pelo modelo.
+app.post(
+  '/api/ia/decompor-roteiro',
+  rota(async (req, res) => {
+    const { texto, bloco_id, inicio, fim, documentos_ids } = req.body ?? {};
+    const conteudo =
+      texto ||
+      (bloco_id && documentos_ids?.length ? materialDoFluxo('roteiro_projeto', bloco_id, documentos_ids).texto : texto);
+    const topicos = bloco_id
+      ? db
+          .prepare('SELECT id, titulo, natureza FROM topicos WHERE bloco_id = ? ORDER BY ordem, rowid')
+          .all(bloco_id)
+      : [];
+    const tipos = db
+      .prepare(
+        `SELECT DISTINCT tipo_tarefa FROM (
+           SELECT tipo_tarefa FROM entregaveis WHERE tipo_tarefa IS NOT NULL AND TRIM(tipo_tarefa) <> ''
+           UNION ALL
+           SELECT tipo_tarefa FROM listas_questoes WHERE tipo_tarefa IS NOT NULL AND TRIM(tipo_tarefa) <> ''
+           UNION ALL
+           SELECT tipo_tarefa FROM avaliacoes WHERE tipo_tarefa IS NOT NULL AND TRIM(tipo_tarefa) <> ''
+         )`
+      )
+      .all()
+      .map((l) => l.tipo_tarefa);
+
+    res.json(
+      await decomporRoteiro(conteudo, topicos, {
+        hoje: hojeISO(),
+        inicio: inicio || null,
+        fim: fim || null,
+        tipos_tarefa: tipos,
+      })
+    );
+  })
+);
+
+// ===========================================================================
+// REPOSITORIO DE DOCUMENTOS DO BLOCO
+//
+// Um documento existe uma unica vez por bloco: o hash decide. Excluir um
+// documento nunca apaga o que foi gerado a partir dele — o conteudo gerado ja
+// esta salvo no item, e so a referencia fica orfa.
+// ===========================================================================
+const CATEGORIAS = new Set([
+  'ementa',
+  'livro_apostila',
+  'lista_exercicios',
+  'prova_antiga',
+  'roteiro_projeto',
+  'calendario',
+  'outro',
+]);
+const TIPOS_USO = new Set([
+  'tabela_conteudos',
+  'lista_questoes',
+  'roteiro_projeto',
+  'importacao_calendario',
+]);
+
+const categoriaValida = (c) => (CATEGORIAS.has(c) ? c : 'outro');
+
+/** Nome de arquivo seguro: nunca sai da pasta do bloco. */
+const nomeSeguro = (nome) =>
+  String(nome || 'arquivo')
+    .replace(/[^\w.\-]+/g, '_')
+    .slice(-80);
+
+/** Acrescenta um sufixo de versao quando o usuario opta por manter os dois. */
+function nomeComVersao(blocoId, nome) {
+  const existentes = db
+    .prepare('SELECT nome_arquivo FROM documentos_fonte WHERE bloco_id = ?')
+    .all(blocoId)
+    .map((d) => d.nome_arquivo);
+  if (!existentes.includes(nome)) return nome;
+
+  const ponto = nome.lastIndexOf('.');
+  const base = ponto > 0 ? nome.slice(0, ponto) : nome;
+  const ext = ponto > 0 ? nome.slice(ponto) : '';
+  let n = 2;
+  while (existentes.includes(`${base} (${n})${ext}`)) n += 1;
+  return `${base} (${n})${ext}`;
+}
+
+// ---------------------------------------------------------------------------
+// Envio de arquivos: multipart (multer), nunca base64 dentro de JSON.
+// ---------------------------------------------------------------------------
+/** Limite por arquivo. Livros inteiros cabem; ajuste aqui se precisar. */
+const LIMITE_ARQUIVO_MB = 100;
+const PASTA_ENVIOS = path.join(PASTA_ARQUIVOS, '_envios');
+fs.mkdirSync(PASTA_ENVIOS, { recursive: true });
+
+const envio = multer({
+  storage: multer.diskStorage({
+    destination: PASTA_ENVIOS,
+    filename: (_req, _arquivo, cb) => cb(null, novoId()),
+  }),
+  limits: { fileSize: LIMITE_ARQUIVO_MB * 1024 * 1024, files: 1 },
+});
+
+/** Multer so entra quando o corpo e multipart; texto colado segue em JSON. */
+const recebeArquivo = (req, res, next) =>
+  req.is('multipart/form-data') ? envio.single('arquivo')(req, res, next) : next();
+
+/** SHA-256 do arquivo, lido em partes: um livro de 100 MB nao vai inteiro para a memoria. */
+function hashDoArquivo(caminho) {
+  return new Promise((resolver, rejeitar) => {
+    const h = crypto.createHash('sha256');
+    fs.createReadStream(caminho)
+      .on('data', (parte) => h.update(parte))
+      .on('end', () => resolver(h.digest('hex')))
+      .on('error', rejeitar);
+  });
+}
+
+const apagarSeExistir = (caminho) => {
+  try {
+    if (caminho) fs.unlinkSync(caminho);
+  } catch {
+    /* ja nao estava la */
+  }
+};
+
+/**
+ * Colunas do documento que a interface usa. conteudo_texto fica de fora: um
+ * livro inteiro nao precisa viajar a cada atualizacao de status.
+ */
+const COLUNAS_DOCUMENTO = `d.id, d.bloco_id, d.nome_arquivo, d.categoria, d.criado_em, d.hash,
+  d.tamanho_bytes, d.tipo_mime, d.caminho_arquivo, LENGTH(d.conteudo_texto) AS caracteres,
+  d.status, d.etapa, d.progresso_feito, d.progresso_total, d.motivo, d.indice, d.paginas,
+  d.sumario IS NOT NULL AS tem_sumario,
+  (SELECT COUNT(*) FROM documento_trechos t WHERE t.documento_id = d.id) AS trechos`;
+
+const documentoParaCliente = (id) => {
+  const d = db.prepare(`SELECT ${COLUNAS_DOCUMENTO} FROM documentos_fonte d WHERE d.id = ?`).get(id);
+  return d
+    ? { ...d, categoria: d.categoria ?? 'outro', status: d.status ?? 'pronto', tem_sumario: d.tem_sumario === 1, usos: [] }
+    : null;
+};
+
+app.get(
+  '/api/blocos/:id/documentos',
+  rota((req, res) => {
+    const docs = db
+      .prepare(
+        `SELECT ${COLUNAS_DOCUMENTO}
+           FROM documentos_fonte d
+          WHERE d.bloco_id = ? ORDER BY d.criado_em DESC, d.rowid DESC`
+      )
+      .all(req.params.id);
+
+    const usos = db
+      .prepare(
+        `SELECT documento_id, item_tipo, COUNT(*) AS quantos
+           FROM documento_usos GROUP BY documento_id, item_tipo`
+      )
+      .all();
+
+    res.json(
+      docs.map((d) => ({
+        ...d,
+        categoria: d.categoria ?? 'outro',
+        status: d.status ?? 'pronto',
+        tem_sumario: d.tem_sumario === 1,
+        precisa_indexar: precisaIndexar(d),
+        usos: usos
+          .filter((u) => u.documento_id === d.id)
+          .map((u) => ({ item_tipo: u.item_tipo, quantos: u.quantos })),
+      }))
+    );
+  })
+);
+
+/**
+ * Registra um documento no repositorio do bloco, com deduplicacao.
+ *
+ * O arquivo (quando ha) ja esta em disco, na pasta de envios. Aqui ele e
+ * reaproveitado, recusado por conflito de nome ou movido para o lugar final.
+ * O texto e extraido depois, pela fila de processamento: a resposta sai logo.
+ */
+async function registrarDocumento(blocoId, d) {
+  const nome = String(d.nome ?? 'documento').trim() || 'documento';
+  const hash = d.arquivo ? await hashDoArquivo(d.arquivo) : calcularHash(String(d.texto ?? ''));
+
+  // 1. Mesmo conteudo ja no bloco: reaproveita, nao grava de novo.
+  const igual = db.prepare('SELECT id FROM documentos_fonte WHERE bloco_id = ? AND hash = ?').get(blocoId, hash);
+  if (igual) {
+    apagarSeExistir(d.arquivo);
+    return { ...documentoParaCliente(igual.id), reaproveitado: true };
+  }
+
+  // 2. Mesmo nome com conteudo diferente: quem decide e o usuario.
+  const mesmoNome = db
+    .prepare('SELECT * FROM documentos_fonte WHERE bloco_id = ? AND nome_arquivo = ?')
+    .get(blocoId, nome);
+  if (mesmoNome && d.resolucao !== 'substituir' && d.resolucao !== 'manter') {
+    apagarSeExistir(d.arquivo);
+    return {
+      conflito: 'nome',
+      nome_arquivo: nome,
+      existente: { id: mesmoNome.id, nome_arquivo: mesmoNome.nome_arquivo, criado_em: mesmoNome.criado_em },
+    };
+  }
+
+  let nomeFinal = nome;
+  if (mesmoNome && d.resolucao === 'manter') nomeFinal = nomeComVersao(blocoId, nome);
+
+  let caminho = null;
+  if (d.arquivo) {
+    const pasta = path.join(PASTA_ARQUIVOS, blocoId);
+    fs.mkdirSync(pasta, { recursive: true });
+    // O hash no nome evita colisao entre arquivos de nome igual.
+    caminho = path.join(blocoId, `${hash.slice(0, 16)}-${nomeSeguro(nomeFinal)}`);
+    fs.renameSync(d.arquivo, path.join(PASTA_ARQUIVOS, caminho));
+  }
+
+  const id = novoId();
+  db.transaction(() => {
+    if (mesmoNome && d.resolucao === 'substituir') {
+      // O arquivo do anterior sai; seus trechos saem junto (ON DELETE CASCADE).
+      if (mesmoNome.caminho_arquivo && mesmoNome.caminho_arquivo !== caminho) {
+        apagarSeExistir(path.join(PASTA_ARQUIVOS, mesmoNome.caminho_arquivo));
+      }
+      db.prepare('DELETE FROM documentos_fonte WHERE id = ?').run(mesmoNome.id);
+    }
+    db.prepare(
+      `INSERT INTO documentos_fonte
+         (id, bloco_id, nome_arquivo, conteudo_texto, criado_em, hash, categoria,
+          caminho_arquivo, tamanho_bytes, tipo_mime, status, extraido)
+       VALUES (?,?,?,?,?,?,?,?,?,?,'processando',0)`
+    ).run(
+      id,
+      blocoId,
+      nomeFinal,
+      d.arquivo ? '' : String(d.texto ?? ''),
+      agora(),
+      hash,
+      categoriaValida(d.categoria),
+      caminho,
+      d.tamanho ?? String(d.texto ?? '').length,
+      d.tipo_mime ?? null
+    );
+    // As referencias do anterior passam para o novo: o uso nao se perde.
+    if (mesmoNome && d.resolucao === 'substituir') {
+      db.prepare('UPDATE documento_usos SET documento_id = ? WHERE documento_id = ?').run(id, mesmoNome.id);
+    }
+  })();
+
+  enfileirar(id);
+  return { ...documentoParaCliente(id), reaproveitado: false };
+}
+
+/**
+ * Envio para o repositorio.
+ * - multipart/form-data: campo "arquivo", mais nome_arquivo, categoria e resolucao;
+ * - JSON { documentos: [{ nome_arquivo, conteudo_texto, categoria, resolucao }] }
+ *   para texto colado.
+ * Responde assim que o arquivo e recebido; a extracao segue em segundo plano.
+ */
+app.post(
+  '/api/blocos/:id/documentos',
+  recebeArquivo,
+  rota(async (req, res) => {
+    const blocoId = req.params.id;
+    if (!db.prepare('SELECT id FROM blocos WHERE id = ?').get(blocoId)) {
+      apagarSeExistir(req.file?.path);
+      return res.status(404).json({ erro: 'Bloco não encontrado.' });
+    }
+
+    if (req.file) {
+      // O nome vem num campo proprio, em UTF-8; o do multipart chega em latin1.
+      const nome =
+        String(req.body?.nome_arquivo ?? '').trim() ||
+        Buffer.from(req.file.originalname, 'latin1').toString('utf8');
+      const resultado = await registrarDocumento(blocoId, {
+        nome,
+        arquivo: req.file.path,
+        tamanho: req.file.size,
+        tipo_mime: req.file.mimetype || null,
+        categoria: req.body?.categoria,
+        resolucao: req.body?.resolucao,
+      });
+      return res.status(201).json({ documentos: [resultado] });
+    }
+
+    const entrada = Array.isArray(req.body?.documentos) ? req.body.documentos : [];
+    if (entrada.some((d) => d?.arquivo_base64)) {
+      return res.status(400).json({
+        erro: 'Arquivos são enviados como multipart/form-data, não em base64.',
+        codigo: 'envio_base64',
+      });
+    }
+    const resultados = [];
+    for (const d of entrada) {
+      resultados.push(
+        await registrarDocumento(blocoId, {
+          nome: d?.nome_arquivo,
+          texto: d?.conteudo_texto,
+          categoria: d?.categoria,
+          resolucao: d?.resolucao,
+          tipo_mime: d?.tipo_mime,
+        })
+      );
+    }
+    res.status(201).json({ documentos: resultados });
+  })
+);
+
+/**
+ * O que um fluxo enviaria ao modelo com esta selecao: tamanho real (nunca o
+ * do documento bruto), teto e, se precisou reduzir, a linha que explica.
+ * So informa — o tamanho nunca bloqueia nada.
+ */
+app.post(
+  '/api/documentos/material',
+  rota((req, res) => {
+    const { bloco_id, fluxo, documentos_ids } = req.body ?? {};
+    // Sem escolha, nada vai (na geracao, "sem escolha" significa "todos").
+    if (!Array.isArray(documentos_ids) || documentos_ids.length === 0) {
+      return res.json({ caracteres: 0, teto: null, reduzido: false, aviso: null, porTrechos: fluxo === 'lista_questoes' });
+    }
+    const { texto: _texto, ...resumo } = materialDoFluxo(fluxo, bloco_id, documentos_ids);
+    res.json(resumo);
+  })
+);
+
+/** Situacao de um documento, para acompanhar o processamento. */
+app.get(
+  '/api/documentos/:id',
+  rota((req, res) => {
+    const d = documentoParaCliente(req.params.id);
+    if (!d) return res.status(404).json({ erro: 'Documento não encontrado.' });
+    res.json(d);
+  })
+);
+
+/**
+ * "Indexar documentos": processa o que ainda nao tem trechos, o que falhou e,
+ * com chave, o que ficou com embeddings incompletos — sem perder o que ja foi feito.
+ */
+app.post(
+  '/api/blocos/:id/documentos/indexar',
+  rota((req, res) => {
+    res.json({ ok: true, na_fila: reindexarBloco(req.params.id) });
+  })
+);
+
+app.patch(
+  '/api/documentos/:id',
+  rota((req, res) => {
+    const atual = db.prepare('SELECT * FROM documentos_fonte WHERE id = ?').get(req.params.id);
+    if (!atual) return res.status(404).json({ erro: 'Documento não encontrado.' });
+    const b = req.body ?? {};
+    db.prepare('UPDATE documentos_fonte SET nome_arquivo = ?, categoria = ? WHERE id = ?').run(
+      b.nome_arquivo === undefined ? atual.nome_arquivo : String(b.nome_arquivo).trim() || atual.nome_arquivo,
+      b.categoria === undefined ? atual.categoria : categoriaValida(b.categoria),
+      atual.id
+    );
+    res.json(db.prepare('SELECT * FROM documentos_fonte WHERE id = ?').get(atual.id));
+  })
+);
+
+app.delete(
+  '/api/documentos/:id',
+  rota((req, res) => {
+    const doc = db.prepare('SELECT * FROM documentos_fonte WHERE id = ?').get(req.params.id);
+    if (!doc) return res.json({ ok: true });
+
+    if (doc.caminho_arquivo) {
+      try {
+        fs.unlinkSync(path.join(PASTA_ARQUIVOS, doc.caminho_arquivo));
+      } catch {
+        /* arquivo ja nao estava la */
+      }
+    }
+    // As linhas de documento_usos ficam: o item gerado continua existindo, e a
+    // referencia passa a aparecer como "documento removido".
+    db.prepare('DELETE FROM documentos_fonte WHERE id = ?').run(doc.id);
+    res.json({ ok: true });
+  })
+);
+
+/** Baixa o arquivo original, quando existe. */
+app.get(
+  '/api/documentos/:id/arquivo',
+  rota((req, res) => {
+    const doc = db.prepare('SELECT * FROM documentos_fonte WHERE id = ?').get(req.params.id);
+    if (!doc) return res.status(404).json({ erro: 'Documento não encontrado.' });
+
+    if (!doc.caminho_arquivo) {
+      // Texto colado nao tem arquivo: devolve o texto extraido.
+      res.type('text/plain; charset=utf-8');
+      return res.send(doc.conteudo_texto ?? '');
+    }
+    const completo = path.join(PASTA_ARQUIVOS, doc.caminho_arquivo);
+    if (!fs.existsSync(completo)) {
+      return res.status(404).json({ erro: 'O arquivo original não está mais disponível.' });
+    }
+    res.download(completo, doc.nome_arquivo);
+  })
+);
+
+/**
+ * Quais documentos originaram um item gerado.
+ *
+ * "item_id" e obrigatorio: a tabela de conteudos nao tem id proprio, entao usa
+ * o id do bloco — sem isso, os usos de blocos diferentes se misturariam.
+ */
+app.post(
+  '/api/documento-usos',
+  rota((req, res) => {
+    const { documentos_ids, item_tipo, item_id } = req.body ?? {};
+    if (!TIPOS_USO.has(item_tipo)) return res.status(400).json({ erro: 'Tipo de uso inválido.' });
+    if (!item_id) return res.status(400).json({ erro: 'Informe a que item o uso se refere.' });
+
+    const ids = Array.isArray(documentos_ids) ? documentos_ids.filter(Boolean) : [];
+    const inserir = db.prepare(
+      'INSERT INTO documento_usos (id, documento_id, item_tipo, item_id, criado_em) VALUES (?,?,?,?,?)'
+    );
+    db.transaction(() => {
+      for (const d of ids) inserir.run(novoId(), d, item_tipo, item_id ?? null, agora());
+    })();
+    res.status(201).json({ ok: true, registrados: ids.length });
+  })
+);
+
+/**
+ * De quais documentos um item foi gerado. O documento pode ja ter sido
+ * excluido: aparece como removido, e o item segue intacto.
+ */
+app.get(
+  '/api/documento-usos/:tipo/:id',
+  rota((req, res) => {
+    res.json(
+      db
+        .prepare(
+          `SELECT u.documento_id, d.nome_arquivo, d.bloco_id
+             FROM documento_usos u
+             LEFT JOIN documentos_fonte d ON d.id = u.documento_id
+            WHERE u.item_tipo = ? AND u.item_id = ?`
+        )
+        .all(req.params.tipo, req.params.id)
+        .map((u) => ({
+          documento_id: u.documento_id,
+          nome_arquivo: u.nome_arquivo,
+          removido: u.nome_arquivo === null,
+        }))
+    );
+  })
+);
+
+// ===========================================================================
+// VINCULOS ENTRE AVALIACAO E ATIVIDADES
+//
+// Uma avaliacao vinculada e REALIZADA PELAS atividades vinculadas: o trabalho
+// passa a ser representado por elas, e a avaliacao sai da fila como item
+// proprio. Assim o mesmo trabalho nunca e contado duas vezes.
+// ===========================================================================
+const TIPOS_ITEM = new Set(['entregavel', 'lista_questoes']);
+
+/** Em que bloco um item vive. Null quando ele nao existe mais. */
+function blocoDoItem(tipo, id) {
+  const tabela = tipo === 'entregavel' ? 'entregaveis' : 'listas_questoes';
+  return db.prepare(`SELECT bloco_id FROM ${tabela} WHERE id = ?`).get(id)?.bloco_id ?? null;
+}
+
+/** Itens vinculados a uma avaliacao, com nome e data. */
+function itensDaAvaliacao(avaliacaoId) {
+  return db
+    .prepare(
+      `SELECT v.item_tipo, v.item_id,
+              COALESCE(e.titulo, l.titulo) AS titulo,
+              COALESCE(e.data_entrega, l.data_prevista) AS data,
+              CASE WHEN e.id IS NOT NULL THEN e.concluido
+                   WHEN l.status = 'completa' THEN 1 ELSE 0 END AS concluido
+         FROM avaliacao_itens v
+         LEFT JOIN entregaveis e ON e.id = v.item_id AND v.item_tipo = 'entregavel'
+         LEFT JOIN listas_questoes l ON l.id = v.item_id AND v.item_tipo = 'lista_questoes'
+        WHERE v.avaliacao_id = ?`
+    )
+    .all(avaliacaoId)
+    // Item ja excluido na origem some do vinculo.
+    .filter((i) => i.titulo !== null);
+}
+
+app.get(
+  '/api/blocos/:id/vinculos',
+  rota((req, res) => {
+    const linhas = db
+      .prepare(
+        `SELECT v.* FROM avaliacao_itens v
+           JOIN avaliacoes a ON a.id = v.avaliacao_id
+          WHERE a.bloco_id = ?`
+      )
+      .all(req.params.id);
+
+    const avaliacoes = db
+      .prepare('SELECT id, titulo FROM avaliacoes WHERE bloco_id = ? ORDER BY ordem, rowid')
+      .all(req.params.id);
+
+    res.json({
+      vinculos: linhas,
+      avaliacoes,
+      porAvaliacao: Object.fromEntries(avaliacoes.map((a) => [a.id, itensDaAvaliacao(a.id)])),
+    });
+  })
+);
+
+/** Define o conjunto inteiro de itens de uma avaliacao. */
+app.put(
+  '/api/avaliacoes/:id/itens',
+  rota((req, res) => {
+    const avaliacao = db.prepare('SELECT * FROM avaliacoes WHERE id = ?').get(req.params.id);
+    if (!avaliacao) return res.status(404).json({ erro: 'Avaliação não encontrada.' });
+
+    const pedidos = Array.isArray(req.body?.itens) ? req.body.itens : [];
+    const itens = [];
+    for (const i of pedidos) {
+      if (!TIPOS_ITEM.has(i?.item_tipo) || !i?.item_id) {
+        return res.status(400).json({ erro: 'Item inválido.' });
+      }
+      const bloco = blocoDoItem(i.item_tipo, i.item_id);
+      if (bloco === null) return res.status(400).json({ erro: 'Esse item não existe mais.' });
+      // Vincular so faz sentido dentro do mesmo bloco: sao a mesma disciplina.
+      if (bloco !== avaliacao.bloco_id) {
+        return res.status(400).json({ erro: 'Só é possível vincular itens do mesmo bloco.' });
+      }
+      // Um item pertence a no maximo uma avaliacao.
+      const dono = db
+        .prepare('SELECT avaliacao_id FROM avaliacao_itens WHERE item_tipo = ? AND item_id = ?')
+        .get(i.item_tipo, i.item_id);
+      if (dono && dono.avaliacao_id !== avaliacao.id) {
+        const nome = db.prepare('SELECT titulo FROM avaliacoes WHERE id = ?').get(dono.avaliacao_id);
+        return res
+          .status(409)
+          .json({ erro: `Esse item já está vinculado a ${nome?.titulo ?? 'outra avaliação'}.` });
+      }
+      itens.push(i);
+    }
+
+    const apagar = db.prepare('DELETE FROM avaliacao_itens WHERE avaliacao_id = ?');
+    const inserir = db.prepare(
+      'INSERT INTO avaliacao_itens (id, avaliacao_id, item_tipo, item_id, criado_em) VALUES (?,?,?,?,?)'
+    );
+    db.transaction(() => {
+      apagar.run(avaliacao.id);
+      for (const i of itens) inserir.run(novoId(), avaliacao.id, i.item_tipo, i.item_id, agora());
+    })();
+
+    res.json({ ok: true, itens: itensDaAvaliacao(avaliacao.id) });
+  })
+);
+
+/** Define (ou tira) a avaliacao de UM item — usado nos formularios do item. */
+app.put(
+  '/api/vinculos/:tipo/:id',
+  rota((req, res) => {
+    const { tipo, id } = req.params;
+    if (!TIPOS_ITEM.has(tipo)) return res.status(400).json({ erro: 'Tipo de item inválido.' });
+
+    const bloco = blocoDoItem(tipo, id);
+    if (bloco === null) return res.status(404).json({ erro: 'Item não encontrado.' });
+
+    const avaliacaoId = req.body?.avaliacao_id ?? null;
+    db.prepare('DELETE FROM avaliacao_itens WHERE item_tipo = ? AND item_id = ?').run(tipo, id);
+    if (!avaliacaoId) return res.json({ ok: true, avaliacao_id: null });
+
+    const avaliacao = db.prepare('SELECT * FROM avaliacoes WHERE id = ?').get(avaliacaoId);
+    if (!avaliacao) return res.status(404).json({ erro: 'Avaliação não encontrada.' });
+    if (avaliacao.bloco_id !== bloco) {
+      return res.status(400).json({ erro: 'Só é possível vincular itens do mesmo bloco.' });
+    }
+
+    db.prepare(
+      'INSERT INTO avaliacao_itens (id, avaliacao_id, item_tipo, item_id, criado_em) VALUES (?,?,?,?,?)'
+    ).run(novoId(), avaliacaoId, tipo, id, agora());
+    res.json({ ok: true, avaliacao_id: avaliacaoId });
+  })
+);
+
+// ===========================================================================
+// EXCLUSAO PELO CALENDARIO
+//
+// Excluir pelo calendario e a MESMA acao de excluir pela tela de origem. As
+// evidencias ja registradas ficam: sao historico do que aconteceu.
+// ===========================================================================
+const TIPOS_CALENDARIO = new Set(['evento', 'avaliacao', 'entregavel', 'lista', 'revisao']);
+
+/** O que o usuario precisa saber antes de confirmar. */
+app.get(
+  '/api/calendario/:tipo/:id/consequencias',
+  rota((req, res) => {
+    const { tipo, id } = req.params;
+    if (!TIPOS_CALENDARIO.has(tipo)) return res.status(400).json({ erro: 'Tipo inválido.' });
+
+    const linhas = [];
+    let vinculo = null;
+
+    if (tipo === 'evento') {
+      linhas.push('O evento será excluído.');
+    } else if (tipo === 'avaliacao') {
+      linhas.push('A avaliação será excluída e deixará de contar no cálculo de média do bloco.');
+      if (itensDaAvaliacao(id).length > 0) {
+        linhas.push('As atividades vinculadas serão mantidas, sem vínculo.');
+      }
+    } else if (tipo === 'entregavel' || tipo === 'lista') {
+      const itemTipo = tipo === 'entregavel' ? 'entregavel' : 'lista_questoes';
+      linhas.push(
+        tipo === 'entregavel'
+          ? 'O entregável será excluído do Modo Projeto, com seus tópicos associados.'
+          : 'A lista e seu gabarito serão excluídos do Modo Prova.'
+      );
+      const dono = db
+        .prepare(
+          `SELECT a.titulo FROM avaliacao_itens v
+             JOIN avaliacoes a ON a.id = v.avaliacao_id
+            WHERE v.item_tipo = ? AND v.item_id = ?`
+        )
+        .get(itemTipo, id);
+      if (dono) {
+        vinculo = dono.titulo;
+        linhas.push(`Ele deixará de fazer parte da avaliação ${dono.titulo}.`);
+      }
+    } else {
+      linhas.push(
+        'Esta revisão será excluída e o ciclo de revisões deste tópico será encerrado.'
+      );
+    }
+
+    linhas.push('As evidências já registradas são mantidas.');
+    res.json({ linhas, vinculo });
+  })
+);
+
+app.delete(
+  '/api/calendario/:tipo/:id',
+  rota((req, res) => {
+    const { tipo, id } = req.params;
+    if (!TIPOS_CALENDARIO.has(tipo)) return res.status(400).json({ erro: 'Tipo inválido.' });
+
+    const itemTipo = tipo === 'entregavel' ? 'entregavel' : tipo === 'lista' ? 'lista_questoes' : null;
+
+    db.transaction(() => {
+      // Os vinculos apontam para o item: somem com ele. As evidencias ficam.
+      if (itemTipo) {
+        db.prepare('DELETE FROM avaliacao_itens WHERE item_tipo = ? AND item_id = ?').run(itemTipo, id);
+      }
+      if (tipo === 'avaliacao') {
+        db.prepare('DELETE FROM avaliacao_itens WHERE avaliacao_id = ?').run(id);
+      }
+      db.prepare('DELETE FROM documento_usos WHERE item_id = ?').run(id);
+
+      if (tipo === 'evento') db.prepare('DELETE FROM eventos WHERE id = ?').run(id);
+      else if (tipo === 'avaliacao') db.prepare('DELETE FROM avaliacoes WHERE id = ?').run(id);
+      else if (tipo === 'entregavel') db.prepare('DELETE FROM entregaveis WHERE id = ?').run(id);
+      else if (tipo === 'lista') db.prepare('DELETE FROM listas_questoes WHERE id = ?').run(id);
+      else db.prepare('DELETE FROM revisoes WHERE id = ?').run(id);
+
+      db.prepare('DELETE FROM ajustes_prioridade WHERE item_id = ?').run(id);
+    })();
+
+    res.json({ ok: true });
+  })
+);
+
+// Rota /api inexistente: JSON, nunca a pagina "Cannot GET".
+app.use('/api', (_req, res) => {
+  res.status(404).json({ erro: 'Rota não encontrada.', codigo: 'rota_inexistente' });
+});
+
+// Ultimo middleware: todo erro vira JSON legivel, e o completo vai para o console.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, _next) => {
+  const { status, erro, codigo } = traduzirErro(err);
+  console.error(`[erro] ${req.method} ${req.originalUrl} -> ${status} ${codigo}`);
+  console.error(err);
+  if (res.headersSent) return;
+  res.status(status).json({ erro, codigo });
+});
+
 app.listen(PORTA, () => {
   console.log(`[servidor] http://localhost:${PORTA}`);
-  console.log(`[servidor] IA: ${iaDisponivel() ? 'Gemini ativo' : 'modo simulado (sem GEMINI_API_KEY)'}`);
+  // Documentos que ainda nao tem trechos (os de antes da busca por trechos) e
+  // os que estavam em processamento quando o servidor parou.
+  const pendentes = retomarPendentes();
+  if (pendentes) console.log(`[servidor] ${pendentes} documento(s) na fila de processamento`);
+  console.log(
+    `[servidor] IA: ${iaDisponivel() ? `Gemini ativo (modelo ${modeloEmUso()})` : 'modo simulado (sem GEMINI_API_KEY)'}`
+  );
 });

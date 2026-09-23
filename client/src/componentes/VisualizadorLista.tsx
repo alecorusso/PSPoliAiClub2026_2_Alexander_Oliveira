@@ -11,6 +11,9 @@ import {
   STATUS_LISTA,
 } from '../util';
 import { Aviso, Etiqueta, IconeChevron, IconeConversa, IconeLixeira, Modal } from './ui';
+import { GeradoAPartirDe } from './GeradoAPartirDe';
+import { textoDaOrigem, textoDoApoio } from '../lib/origem';
+import { CampoAvaliacao } from './CampoAvaliacao';
 
 /**
  * Visualizador de lista, usado tanto pelas listas do Modo Prova quanto pelos
@@ -45,6 +48,14 @@ export function VisualizadorLista({
   }, [lista?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const questoes = useMemo(() => lerQuestoes(lista?.enunciado ?? null), [lista?.enunciado]);
+  // "Baseada nas páginas 112–130 de <livro>": de onde a lista gerada saiu.
+  const origemPaginas = useMemo(() => {
+    try {
+      return lista?.origem_paginas ? textoDaOrigem(JSON.parse(lista.origem_paginas)) : '';
+    } catch {
+      return '';
+    }
+  }, [lista?.origem_paginas]);
   const gabarito = useMemo(() => lerGabarito(lista?.gabarito ?? null), [lista?.gabarito]);
 
   if (!lista) return null;
@@ -92,6 +103,16 @@ export function VisualizadorLista({
         {Array.isArray(questoes) && <span>· {questoes.length} questões</span>}
       </div>
 
+      {/* De quais documentos ela saiu. Some se não veio de documento nenhum. */}
+      <div className="-mt-3 mb-4">
+        <GeradoAPartirDe tipo="lista_questoes" itemId={lista.id} blocoId={lista.bloco_id} />
+        {origemPaginas && <p className="text-xs text-zinc-400 dark:text-zinc-500">{origemPaginas}</p>}
+      </div>
+
+      <div className="mb-4 sm:max-w-sm">
+        <CampoAvaliacao blocoId={lista.bloco_id} itemTipo="lista_questoes" itemId={lista.id} />
+      </div>
+
       {/* Seletor de status, sempre visível. Só o usuário muda. */}
       <div className="mb-4 flex flex-wrap items-center gap-3 rounded-lg border border-zinc-200 px-3 py-2.5 dark:border-zinc-800">
         <span className="text-sm font-medium">Status</span>
@@ -130,7 +151,13 @@ export function VisualizadorLista({
                 <span className="w-6 shrink-0 pt-0.5 text-sm font-semibold text-zinc-400 dark:text-zinc-500">
                   {q.numero}.
                 </span>
-                <p className="whitespace-pre-wrap text-[15px] leading-relaxed">{q.enunciado}</p>
+                <div className="min-w-0">
+                  <p className="whitespace-pre-wrap text-[15px] leading-relaxed">{q.enunciado}</p>
+                  {/* Em que trecho a questão se apoia — discreto. */}
+                  {q.apoio && (
+                    <p className="mt-1 text-xs text-zinc-400 dark:text-zinc-500">{textoDoApoio(q.apoio)}</p>
+                  )}
+                </div>
               </li>
             ))}
           </ol>

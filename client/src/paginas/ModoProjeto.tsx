@@ -9,6 +9,17 @@ import {
   topicosParaLinhas,
 } from '../util';
 import { ModalCriarLista } from '../componentes/ModaisLista';
+import { ModalMontarDoRoteiro } from '../componentes/MontarDoRoteiro';
+import { GeradoAPartirDe } from '../componentes/GeradoAPartirDe';
+import { CampoAvaliacao } from '../componentes/CampoAvaliacao';
+import {
+  CampoEstimativa,
+  ESTIMATIVA_VAZIA,
+  estimativaDe,
+  horasParaMinutos,
+  minutosParaHoras,
+  type Estimativa,
+} from '../componentes/CampoEstimativa';
 import { VisualizadorLista } from '../componentes/VisualizadorLista';
 import { LinhaLista } from './ModoProva';
 import {
@@ -18,6 +29,7 @@ import {
   IconeBussola,
   IconeLista,
   IconeMais,
+  IconeUpload,
   IconeLixeira,
   IconeX,
   Modal,
@@ -31,10 +43,13 @@ export function ModoProjeto({
   bloco,
   aoCorrigir,
   aoAtualizarBloco,
+  aoAbrirTabela,
 }: {
   bloco: Bloco;
   aoCorrigir: (lista: ListaQuestoes) => Promise<void>;
   aoAtualizarBloco: () => void;
+  /** Para adicionar os tópicos que o roteiro menciona e a tabela não tem. */
+  aoAbrirTabela: () => void;
 }) {
   const [topicos, setTopicos] = useState<Topico[]>([]);
   const [entregaveis, setEntregaveis] = useState<Entregavel[]>([]);
@@ -46,6 +61,7 @@ export function ModoProjeto({
   const [reagendando, setReagendando] = useState<Entregavel | null>(null);
   const [excluindo, setExcluindo] = useState<Entregavel | null>(null);
   const [pedindoTeste, setPedindoTeste] = useState(false);
+  const [montandoDoRoteiro, setMontandoDoRoteiro] = useState(false);
   const [abertaLista, setAbertaLista] = useState<ListaQuestoes | null>(null);
   const [recado, setRecado] = useState<string | null>(null);
 
@@ -106,12 +122,21 @@ export function ModoProjeto({
           <h2 className="text-sm font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
             Entregáveis
           </h2>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             <button className="btn-secundario py-1.5" onClick={() => setNovoAberto(true)}>
               <IconeMais className="h-3.5 w-3.5" />
               Novo entregável
             </button>
+            <button className="btn-secundario py-1.5" onClick={() => setMontandoDoRoteiro(true)}>
+              <IconeUpload className="h-3.5 w-3.5" />
+              Montar a partir do roteiro
+            </button>
           </div>
+        </div>
+
+        {/* De quais documentos os entregáveis foram montados. */}
+        <div className="mb-3">
+          <GeradoAPartirDe tipo="roteiro_projeto" itemId={bloco.id} blocoId={bloco.id} />
         </div>
 
         {/* Contagem pura — nunca percentual de domínio, nota ou nível. */}
@@ -256,6 +281,17 @@ export function ModoProjeto({
       </section>
 
       {/* ===================== MODAIS ===================== */}
+      <ModalMontarDoRoteiro
+        aberto={montandoDoRoteiro}
+        blocoId={bloco.id}
+        blocoNome={bloco.nome}
+        aoFechar={() => setMontandoDoRoteiro(false)}
+        aoCriar={() => void carregar()}
+        aoAbrirTabela={() => {
+          setMontandoDoRoteiro(false);
+          aoAbrirTabela();
+        }}
+      />
       <ModalEntregavel
         aberto={novoAberto || editando !== null}
         blocoId={bloco.id}
@@ -466,7 +502,7 @@ function ModalEntregavel({
   const [titulo, setTitulo] = useState('');
   const [descricao, setDescricao] = useState('');
   const [ferramentas, setFerramentas] = useState('');
-  const [tempo, setTempo] = useState('');
+  const [estimativa, setEstimativa] = useState<Estimativa>(ESTIMATIVA_VAZIA);
   const [data, setData] = useState('');
   const [selecionados, setSelecionados] = useState<string[]>([]);
   const [erro, setErro] = useState<string | null>(null);
@@ -478,7 +514,13 @@ function ModalEntregavel({
     setTitulo(entregavel?.titulo ?? '');
     setDescricao(entregavel?.descricao ?? '');
     setFerramentas(entregavel?.ferramentas ?? '');
-    setTempo(entregavel?.tempo_estimado_horas != null ? String(entregavel.tempo_estimado_horas) : '');
+    setEstimativa(
+      estimativaDe(
+        horasParaMinutos(entregavel?.tempo_estimado_horas ?? null),
+        entregavel?.origem_estimativa ?? null,
+        entregavel?.tipo_tarefa ?? null
+      )
+    );
     setData(entregavel?.data_entrega ?? '');
     setSelecionados(entregavel?.topicos.map((t) => t.id) ?? []);
     setErro(null);
@@ -490,7 +532,9 @@ function ModalEntregavel({
       titulo,
       descricao,
       ferramentas,
-      tempo_estimado_horas: tempo,
+      tempo_estimado_horas: minutosParaHoras(estimativa.minutos),
+      origem_estimativa: estimativa.minutos ? estimativa.origem : null,
+      tipo_tarefa: estimativa.tipoTarefa.trim() || null,
       data_entrega: data || null,
       topico_ids: selecionados,
     };
@@ -557,8 +601,8 @@ function ModalEntregavel({
           )}
         </div>
 
-        <div className="grid gap-3 sm:grid-cols-3">
-          <div className="sm:col-span-2">
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div>
             <label className="rotulo">Ferramentas utilizadas</label>
             <input
               className="campo"
@@ -568,22 +612,22 @@ function ModalEntregavel({
             />
           </div>
           <div>
-            <label className="rotulo">Tempo estimado (h)</label>
-            <input
-              className="campo"
-              type="number"
-              min={0}
-              step="0.5"
-              value={tempo}
-              onChange={(e) => setTempo(e.target.value)}
-            />
+            <label className="rotulo">Data de entrega</label>
+            <input className="campo" type="date" value={data} onChange={(e) => setData(e.target.value)} />
           </div>
         </div>
 
-        <div>
-          <label className="rotulo">Data de entrega</label>
-          <input className="campo" type="date" value={data} onChange={(e) => setData(e.target.value)} />
-        </div>
+        <CampoEstimativa
+          valor={estimativa}
+          aoMudar={setEstimativa}
+          descricao={[titulo, descricao].filter(Boolean).join('. ')}
+          contexto="entregável de projeto"
+        />
+
+        {/* Só faz sentido depois que o entregável existe. */}
+        {entregavel && (
+          <CampoAvaliacao blocoId={blocoId} itemTipo="entregavel" itemId={entregavel.id} />
+        )}
 
         {erro && <Aviso tom="atencao">{erro}</Aviso>}
       </div>

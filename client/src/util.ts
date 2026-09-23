@@ -248,6 +248,7 @@ export const ROTULO_ORIGEM: Record<OrigemLista, string> = {
   enviada: 'Enviada',
   gerada_fontes: 'Gerada de documentos',
   gerada_internet: 'Gerada da internet',
+  gerada_geral: 'Gerada por conhecimento geral',
 };
 
 export const ROTULO_STATUS_LISTA: Record<StatusLista, string> = {
@@ -306,7 +307,7 @@ export const contarQuestoes = (questoes: Questao[] | string) =>
   Array.isArray(questoes) ? questoes.length : 0;
 
 // ---------------------------------------------------------------------------
-// Wrapper acadêmico — aritmética de médias
+// Painel Acadêmico — aritmética de médias
 //
 // Nada aqui é um julgamento da plataforma: as notas são dado acadêmico
 // informado pelo usuário, e o cálculo é a aritmética que ele mesmo faria.

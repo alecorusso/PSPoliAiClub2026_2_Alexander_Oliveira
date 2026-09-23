@@ -24,6 +24,7 @@ import {
   TagNatureza,
   Vazio,
 } from '../componentes/ui';
+import { GeradoAPartirDe } from '../componentes/GeradoAPartirDe';
 
 export function ModoAprendizagem({
   bloco,
@@ -157,6 +158,11 @@ export function ModoAprendizagem({
               {marcados} de {topicos.length} tópicos marcados
             </span>
           )}
+        </div>
+
+        {/* De quais documentos a tabela de conteúdos foi gerada. */}
+        <div className="mb-3">
+          <GeradoAPartirDe tipo="tabela_conteudos" itemId={bloco.id} blocoId={bloco.id} />
         </div>
 
         {/* Contagem objetiva de checks — sem nota, score ou percentual. */}

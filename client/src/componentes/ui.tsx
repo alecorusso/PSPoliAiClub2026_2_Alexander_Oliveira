@@ -56,6 +56,8 @@ export const IconeSol = svg(<><circle cx="12" cy="12" r="4" /><path d="M12 2v2M1
 export const IconeLua = svg(<><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z" /></>);
 export const IconeMinimizar = svg(<><path d="M5 18h14" /></>);
 export const IconeExpandir = svg(<><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3" /></>);
+export const IconeAcademico = svg(<><path d="M2 9 12 4l10 5-10 5L2 9Z" /><path d="M6 11.2V16c0 1.1 2.7 2.2 6 2.2s6-1.1 6-2.2v-4.8" /><path d="M22 9v5" /></>);
+export const IconeArrastar = svg(<><path d="M9 6h.01M9 12h.01M9 18h.01M15 6h.01M15 12h.01M15 18h.01" /></>);
 export const IconeLink = svg(<><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7" /><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7" /></>);
 
 // ---------------------------------------------------------------------------

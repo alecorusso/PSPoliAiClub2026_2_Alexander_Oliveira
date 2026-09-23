@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   DndContext,
   DragOverlay,
@@ -12,11 +12,13 @@ import {
   type DragEndEvent,
   type DragStartEvent,
 } from '@dnd-kit/core';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { api } from '../api';
 import type { Bloco, Pasta } from '../tipos';
 import { cn, formatarData } from '../util';
 import { MenuContexto, type ItemMenu } from '../componentes/MenuContexto';
+import { GrafoBlocos } from '../componentes/GrafoBlocos';
+import { guardarRotaBlocos, guardarUltimaPasta, lerUltimaPasta } from '../estado/memoriaBlocos';
 import {
   Carregando,
   Confirmacao,
@@ -56,21 +58,55 @@ function descendentesDe(pastas: Pasta[], pastaId: string) {
 }
 
 /**
- * Sob o ponteiro, uma pasta sempre vence a área do nível atual — as duas zonas
- * se sobrepõem, e sem isso o alvo ficaria ambíguo.
+ * Sob o ponteiro, uma pasta (na grade ou no breadcrumb) sempre vence a área do
+ * nível atual — as zonas se sobrepõem, e sem isso o alvo ficaria ambíguo.
  */
 const deteccaoDeColisao: CollisionDetection = (args) => {
   const sob = pointerWithin(args);
-  const pasta = sob.find((c) => String(c.id).startsWith('pasta-'));
-  return pasta ? [pasta] : sob.filter((c) => c.id === 'nivel-atual');
+  const alvo = sob.find((c) => {
+    const id = String(c.id);
+    return id.startsWith('pasta-') || id.startsWith('trilha-');
+  });
+  return alvo ? [alvo] : sob.filter((c) => c.id === 'nivel-atual');
 };
+
+/** Converte o id da zona de soltura na pasta de destino (null = raiz). */
+function destinoDaZona(idZona: string, pastaAtual: string | null): string | null {
+  if (idZona === 'nivel-atual') return pastaAtual;
+  if (idZona === 'trilha-raiz') return null;
+  if (idZona.startsWith('trilha-')) return idZona.slice(7);
+  if (idZona.startsWith('pasta-')) return idZona.slice(6);
+  return pastaAtual;
+}
 
 export function PaginaBlocos() {
   const navegar = useNavigate();
   const [pastas, setPastas] = useState<Pasta[]>([]);
   const [blocos, setBlocos] = useState<Bloco[]>([]);
   const [carregando, setCarregando] = useState(true);
-  const [pastaAtual, setPastaAtual] = useState<string | null>(null);
+  // A pasta aberta fica na URL (?pasta=<id>): sobrevive a sair e voltar da aba,
+  // ao recarregar a página e ao botão "voltar" do navegador.
+  const [parametros, setParametros] = useSearchParams();
+  // "?pasta=" (vazio) é a forma explícita de pedir a raiz, sem retomar a memória.
+  const pastaAtual = parametros.get('pasta') || null;
+  // O modo fica na URL, como a pasta aberta: sobrevive a recarregar e ao voltar.
+  const modo = parametros.get('vista') === 'grafo' ? 'grafo' : 'pastas';
+  const irParaModo = (novo: 'pastas' | 'grafo') => {
+    const p = new URLSearchParams(parametros);
+    if (novo === 'grafo') p.set('vista', 'grafo');
+    else p.delete('vista');
+    setParametros(p, { replace: true });
+  };
+
+  const jaRestaurou = useRef(false);
+
+  const irParaPasta = useCallback(
+    (id: string | null, substituir = false) => {
+      setParametros(id ? { pasta: id } : {}, { replace: substituir });
+      guardarUltimaPasta(id);
+    },
+    [setParametros]
+  );
   const [busca, setBusca] = useState('');
   const [filtro, setFiltro] = useState<Filtro>('todos');
 
@@ -92,6 +128,30 @@ export function PaginaBlocos() {
   useEffect(() => {
     void carregar();
   }, [carregar]);
+
+  // Guarda onde estamos, para o item "Blocos" da barra lateral voltar aqui.
+  useEffect(() => {
+    guardarRotaBlocos(pastaAtual ? `/blocos?pasta=${pastaAtual}` : '/blocos');
+  }, [pastaAtual]);
+
+  useEffect(() => {
+    if (carregando) return;
+
+    // A pasta da URL pode ter sido excluída: nesse caso, volta para a raiz.
+    if (pastaAtual && !pastas.some((p) => p.id === pastaAtual)) {
+      irParaPasta(null, true);
+      return;
+    }
+
+    // Primeira entrada sem pasta na URL: retoma a última que estava aberta.
+    if (!jaRestaurou.current) {
+      jaRestaurou.current = true;
+      if (!parametros.has('pasta')) {
+        const guardada = lerUltimaPasta();
+        if (guardada && pastas.some((p) => p.id === guardada)) irParaPasta(guardada, true);
+      }
+    }
+  }, [carregando, pastas, pastaAtual, parametros, irParaPasta]);
 
   // Caminho da pasta atual, para o breadcrumb.
   const trilha = useMemo(() => {
@@ -219,8 +279,8 @@ export function PaginaBlocos() {
     if (!alvo || !over) return;
 
     const idAtivo = String(active.id);
-    // Soltar em área vazia move para o nível atual do breadcrumb.
-    const destino = over.id === 'nivel-atual' ? pastaAtual : String(over.id).slice(6);
+    // Soltar em área vazia mantém no nível atual; no breadcrumb, sobe de nível.
+    const destino = destinoDaZona(String(over.id), pastaAtual);
     if (destino === idAtivo.slice(6)) return;
 
     const atual = alvo.tipo === 'pasta' ? alvo.dado.pasta_pai_id : alvo.dado.pasta_id;
@@ -235,32 +295,62 @@ export function PaginaBlocos() {
 
   return (
     <div className="mx-auto max-w-6xl px-6 py-6">
+      <DndContext
+        sensors={sensores}
+        collisionDetection={deteccaoDeColisao}
+        onDragStart={aoIniciarArraste}
+        onDragEnd={(e) => void aoSoltar(e)}
+        onDragCancel={() => setArrastando(null)}
+      >
       {/* Cabeçalho */}
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
         <div className="min-w-0">
           <h1 className="text-xl font-semibold">Blocos</h1>
+          {/* Cada item do breadcrumb também recebe itens soltos: é por aqui que
+              um bloco sai de uma pasta e sobe de nível. */}
           <nav className="mt-1 flex flex-wrap items-center gap-1 text-sm text-zinc-500 dark:text-zinc-400">
-            <button
-              className={cn('rounded px-1.5 py-0.5 hover:bg-zinc-200 dark:hover:bg-zinc-800', !pastaAtual && 'font-medium text-zinc-800 dark:text-zinc-200')}
-              onClick={() => setPastaAtual(null)}
-            >
-              Todos os blocos
-            </button>
+            <ItemTrilha
+              id="trilha-raiz"
+              rotulo="Todos os blocos"
+              ativo={!pastaAtual}
+              arrastando={Boolean(arrastando)}
+              aoClicar={() => irParaPasta(null)}
+            />
             {trilha.map((p) => (
               <span key={p.id} className="flex items-center gap-1">
                 <IconeChevron className="h-3 w-3" />
-                <button
-                  className={cn(
-                    'rounded px-1.5 py-0.5 hover:bg-zinc-200 dark:hover:bg-zinc-800',
-                    p.id === pastaAtual && 'font-medium text-zinc-800 dark:text-zinc-200'
-                  )}
-                  onClick={() => setPastaAtual(p.id)}
-                >
-                  {p.nome}
-                </button>
+                <ItemTrilha
+                  id={`trilha-${p.id}`}
+                  rotulo={p.nome}
+                  ativo={p.id === pastaAtual}
+                  arrastando={Boolean(arrastando)}
+                  desabilitado={proibidos.has(p.id)}
+                  aoClicar={() => irParaPasta(p.id)}
+                />
               </span>
             ))}
           </nav>
+
+        </div>
+
+        <div className="flex items-center gap-2">
+        {/* Pastas ou mapa: a mesma coleção, duas formas de percorrer. */}
+        <div className="flex rounded-lg border border-zinc-200 p-0.5 dark:border-zinc-800">
+          {(['pastas', 'grafo'] as const).map((m) => (
+            <button
+              key={m}
+              className={cn(
+                'rounded-md px-3 py-1 text-sm transition',
+                modo === m
+                  ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900'
+                  : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+              )}
+              onClick={() => irParaModo(m)}
+              aria-pressed={modo === m}
+            >
+              {m === 'pastas' ? 'Pastas' : 'Grafo'}
+            </button>
+          ))}
         </div>
 
         {/* Botão "+" com duas opções */}
@@ -288,8 +378,17 @@ export function PaginaBlocos() {
             />
           )}
         </div>
+        </div>
       </div>
 
+      {/* No mapa, a busca e os filtros ficam dentro do próprio grafo: são
+          outros controles, sobre a mesma coleção. */}
+      {modo === 'grafo' ? (
+        <div className="h-[calc(100vh-11rem)] overflow-hidden rounded-xl border border-zinc-200 dark:border-zinc-800">
+          <GrafoBlocos aoAbrirBloco={(id) => navegar(`/blocos/${id}`)} />
+        </div>
+      ) : (
+      <>
       {/* Busca e filtros */}
       <div className="mb-5 flex flex-wrap items-center gap-2">
         <div className="relative min-w-56 flex-1">
@@ -325,9 +424,16 @@ export function PaginaBlocos() {
         </div>
       </div>
 
-      {buscando && (
+      {buscando && !arrastando && (
         <p className="mb-3 text-xs text-zinc-500 dark:text-zinc-400">
           Buscando em todas as pastas. Limpe a busca para voltar à navegação por pastas.
+        </p>
+      )}
+
+      {arrastando && (
+        <p className="mb-3 text-xs text-indigo-600 dark:text-indigo-400">
+          Solte numa pasta para mover para dentro dela, ou no caminho acima para tirar
+          {arrastando.tipo === 'pasta' ? ' a pasta ' : ' o bloco '}daqui.
         </p>
       )}
 
@@ -335,7 +441,8 @@ export function PaginaBlocos() {
       {carregando ? (
         <Carregando />
       ) : vazio ? (
-        <Vazio
+        <AreaDoNivel vazia>
+          <Vazio
           icone={<IconeBloco className="h-8 w-8" />}
           titulo={buscando ? 'Nenhum resultado' : 'Esta pasta está vazia'}
           descricao={
@@ -355,15 +462,9 @@ export function PaginaBlocos() {
               </div>
             )
           }
-        />
+          />
+        </AreaDoNivel>
       ) : (
-        <DndContext
-          sensors={sensores}
-          collisionDetection={deteccaoDeColisao}
-          onDragStart={aoIniciarArraste}
-          onDragEnd={(e) => void aoSoltar(e)}
-          onDragCancel={() => setArrastando(null)}
-        >
           <AreaDoNivel>
           {pastasVisiveis.map((p) => (
             <Card
@@ -378,7 +479,7 @@ export function PaginaBlocos() {
               icone={<IconePasta className="h-7 w-7" />}
               aoAbrir={() => {
                 setBusca('');
-                setPastaAtual(p.id);
+                irParaPasta(p.id);
               }}
               aoMenu={(e) => abrirMenu(e, { tipo: 'pasta', dado: p })}
             />
@@ -404,22 +505,24 @@ export function PaginaBlocos() {
             />
           ))}
           </AreaDoNivel>
-
-          {/* Prévia que acompanha o cursor durante o arraste. */}
-          <DragOverlay dropAnimation={null}>
-            {arrastando && (
-              <div className="cartao flex w-40 items-center gap-2 p-3 shadow-xl">
-                {arrastando.tipo === 'pasta' ? (
-                  <IconePasta className="h-5 w-5 shrink-0 text-zinc-400" />
-                ) : (
-                  <IconeBloco className="h-5 w-5 shrink-0 text-zinc-400" />
-                )}
-                <span className="truncate text-sm font-medium">{arrastando.dado.nome}</span>
-              </div>
-            )}
-          </DragOverlay>
-        </DndContext>
       )}
+      </>
+      )}
+
+      {/* Prévia que acompanha o cursor durante o arraste. */}
+      <DragOverlay dropAnimation={null}>
+        {arrastando && (
+          <div className="cartao ml-5 mt-5 flex w-40 items-center gap-2 p-2.5 opacity-90 shadow-xl">
+            {arrastando.tipo === 'pasta' ? (
+              <IconePasta className="h-5 w-5 shrink-0 text-zinc-400" />
+            ) : (
+              <IconeBloco className="h-5 w-5 shrink-0 text-zinc-400" />
+            )}
+            <span className="truncate text-sm font-medium">{arrastando.dado.nome}</span>
+          </div>
+        )}
+      </DragOverlay>
+      </DndContext>
 
       {menu && (
         <MenuContexto x={menu.x} y={menu.y} itens={itensMenu(menu.alvo)} aoFechar={() => setMenu(null)} />
@@ -464,18 +567,59 @@ export function PaginaBlocos() {
 // ---------------------------------------------------------------------------
 // Área do nível atual: soltar aqui move o item para a pasta do breadcrumb.
 // ---------------------------------------------------------------------------
-function AreaDoNivel({ children }: { children: React.ReactNode }) {
+function AreaDoNivel({ children, vazia }: { children: React.ReactNode; vazia?: boolean }) {
   const { setNodeRef, isOver } = useDroppable({ id: 'nivel-atual' });
   return (
     <div
       ref={setNodeRef}
       className={cn(
-        'grid min-h-40 grid-cols-[repeat(auto-fill,minmax(160px,1fr))] gap-3 rounded-xl p-1 transition',
+        'min-h-40 rounded-xl p-1 transition',
+        !vazia && 'grid grid-cols-[repeat(auto-fill,minmax(160px,1fr))] gap-3',
         isOver && 'bg-zinc-200/50 dark:bg-zinc-800/40'
       )}
     >
       {children}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Item do breadcrumb: navega ao clique e recebe itens soltos, que é como um
+// bloco ou uma pasta sai de dentro de uma pasta.
+// ---------------------------------------------------------------------------
+function ItemTrilha({
+  id,
+  rotulo,
+  ativo,
+  arrastando,
+  desabilitado,
+  aoClicar,
+}: {
+  id: string;
+  rotulo: string;
+  ativo: boolean;
+  arrastando: boolean;
+  desabilitado?: boolean;
+  aoClicar: () => void;
+}) {
+  const { setNodeRef, isOver } = useDroppable({ id, disabled: desabilitado });
+  return (
+    <button
+      ref={setNodeRef}
+      onClick={aoClicar}
+      className={cn(
+        'rounded transition hover:bg-zinc-200 dark:hover:bg-zinc-800',
+        ativo && 'font-medium text-zinc-800 dark:text-zinc-200',
+        // Enquanto há arraste a zona cresce e ganha contorno, para virar um
+        // alvo confortável em vez de um texto fino.
+        arrastando && !desabilitado
+          ? 'border border-dashed border-indigo-400 bg-white px-2.5 py-1.5 dark:bg-zinc-900'
+          : 'px-1.5 py-0.5',
+        isOver && 'border-solid border-indigo-600 bg-indigo-100 text-indigo-800 dark:bg-indigo-950 dark:text-indigo-200'
+      )}
+    >
+      {rotulo}
+    </button>
   );
 }
 
@@ -521,10 +665,9 @@ function Card({
   return (
     <div
       ref={referencia}
-      {...listeners}
       onContextMenu={aoMenu}
       className={cn(
-        'cartao group relative flex aspect-square cursor-grab flex-col justify-between p-3 text-left transition',
+        'cartao group relative flex aspect-square flex-col justify-between p-3 text-left transition',
         'hover:border-indigo-400 hover:shadow-sm dark:hover:border-indigo-600',
         oculto && 'opacity-60',
         isDragging && 'opacity-40',
@@ -532,7 +675,18 @@ function Card({
         isOver && 'border-indigo-500 ring-2 ring-indigo-500/40 dark:border-indigo-400'
       )}
     >
-      <div className="flex items-start justify-between">
+      {/* Alça de arraste: faixa curta ocupando todo o topo do card. O corpo
+          abaixo segue sendo clique, sem risco de virar arraste sem querer. */}
+      <div
+        {...listeners}
+        title="Arraste para mover"
+        className={cn(
+          '-mx-3 -mt-3 mb-1 flex cursor-grab items-center justify-between rounded-t-xl px-3 py-2',
+          'border-b border-transparent transition active:cursor-grabbing',
+          'group-hover:border-zinc-200 group-hover:bg-zinc-100/70',
+          'dark:group-hover:border-zinc-800 dark:group-hover:bg-zinc-800/50'
+        )}
+      >
         <span className="text-zinc-400 dark:text-zinc-500">{icone}</span>
         <span className="flex items-center gap-1">
           {favorito && <IconeEstrela className="h-3.5 w-3.5 text-amber-500" />}
@@ -541,6 +695,8 @@ function Card({
             type="button"
             aria-label={`Abrir menu de ${nome}`}
             onClick={aoMenu}
+            // O botão vive dentro da faixa: impedir que o toque inicie um arraste.
+            onPointerDown={(e) => e.stopPropagation()}
             className="rounded px-1.5 text-lg leading-none text-zinc-400 opacity-0 transition hover:bg-zinc-200 focus:opacity-100 group-hover:opacity-100 dark:hover:bg-zinc-800"
           >
             ⋯

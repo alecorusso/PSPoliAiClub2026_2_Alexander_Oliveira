@@ -3,12 +3,20 @@ import urlWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
 pdfjs.GlobalWorkerOptions.workerSrc = urlWorker;
 
-export const EXTENSOES_ACEITAS = '.txt,.md,.pdf';
+export const EXTENSOES_ACEITAS = '.txt,.md,.pdf,.docx';
 
-/** Extrai o texto de .txt, .md e .pdf. O PDF é lido no navegador; o servidor
- *  recebe apenas o texto já extraído. */
+/** Extrai o texto de .txt, .md, .pdf e .docx. Tudo é lido no navegador; o
+ *  servidor recebe apenas o texto já extraído. */
 export async function extrairTexto(arquivo: File): Promise<string> {
   const nome = arquivo.name.toLowerCase();
+
+  if (nome.endsWith('.docx')) {
+    // mammoth só é carregado quando aparece um .docx: é pesado e raro. O campo
+    // "browser" do pacote troca os módulos de Node pelos do navegador.
+    const mammoth = await import('mammoth');
+    const { value } = await mammoth.extractRawText({ arrayBuffer: await arquivo.arrayBuffer() });
+    return value.trim();
+  }
 
   if (nome.endsWith('.pdf')) {
     const buffer = await arquivo.arrayBuffer();

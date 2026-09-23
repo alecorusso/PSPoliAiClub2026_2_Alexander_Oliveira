@@ -1,12 +1,15 @@
 import { useEffect, useState } from 'react';
-import { BrowserRouter, NavLink, Navigate, Route, Routes } from 'react-router-dom';
+import { BrowserRouter, Link, NavLink, Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import { PaginaInicio } from './paginas/Inicio';
 import { PaginaBlocos } from './paginas/Blocos';
 import { PaginaBloco } from './paginas/Bloco';
+import { PaginaCalendario } from './paginas/Calendario';
+import { PaginaDesempenho } from './paginas/Desempenho';
 import { JanelaSondagem } from './componentes/JanelaSondagem';
 import { PainelFoco } from './componentes/PainelFoco';
 import { ProvedorSondagem, useSondagem } from './estado/sondagem';
 import { ProvedorFoco, useFoco } from './estado/foco';
+import { lerRotaBlocos } from './estado/memoriaBlocos';
 import { cn, relogio } from './util';
 import {
   IconeBlocos,
@@ -48,6 +51,10 @@ function Layout() {
           <Route path="/inicio" element={<PaginaInicio />} />
           <Route path="/blocos" element={<PaginaBlocos />} />
           <Route path="/blocos/:id" element={<PaginaBloco />} />
+          <Route path="/calendario" element={<PaginaCalendario />} />
+          <Route path="/desempenho" element={<PaginaDesempenho />} />
+          {/* O cronograma deixou de ser aba: agora é a coluna direita do calendário. */}
+          <Route path="/cronograma" element={<Navigate to="/calendario" replace />} />
           <Route path="*" element={<Navigate to="/inicio" replace />} />
         </Routes>
       </main>
@@ -59,6 +66,7 @@ function Layout() {
 
 function BarraLateral() {
   const [escuro, setEscuro] = useState(() => document.documentElement.classList.contains('dark'));
+  const local = useLocation();
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', escuro);
@@ -77,6 +85,12 @@ function BarraLateral() {
         : 'text-zinc-600 hover:bg-zinc-200/60 dark:text-zinc-400 dark:hover:bg-zinc-800/60'
     );
 
+  // "Blocos" leva de volta exatamente onde você parou: a pasta que estava
+  // aberta ou o bloco que estava aberto. Lido a cada navegação, porque a
+  // memória é escrita pelas próprias páginas.
+  const emBlocos = local.pathname.startsWith('/blocos');
+  const destinoBlocos = lerRotaBlocos() ?? '/blocos';
+
   return (
     <aside
       aria-label="Navegação principal"
@@ -92,14 +106,20 @@ function BarraLateral() {
           <IconeCasa />
           Início
         </NavLink>
-        <NavLink to="/blocos" className={classe}>
+        <Link to={destinoBlocos} className={classe({ isActive: emBlocos })}>
           <IconeBlocos />
           Blocos
+        </Link>
+
+        <NavLink to="/calendario" className={classe}>
+          <IconeCalendario />
+          Calendário
         </NavLink>
 
-        {/* Entradas desabilitadas — páginas fora desta etapa. */}
-        <ItemDesabilitado icone={<IconeCalendario />} rotulo="Calendário" />
-        <ItemDesabilitado icone={<IconeGrafico />} rotulo="Desempenho" />
+        <NavLink to="/desempenho" className={classe}>
+          <IconeGrafico />
+          Desempenho
+        </NavLink>
       </nav>
 
       <div className="flex-1" />
@@ -114,19 +134,6 @@ function BarraLateral() {
         {escuro ? 'Tema claro' : 'Tema escuro'}
       </button>
     </aside>
-  );
-}
-
-function ItemDesabilitado({ icone, rotulo }: { icone: React.ReactNode; rotulo: string }) {
-  return (
-    <span
-      title="Em desenvolvimento"
-      aria-disabled="true"
-      className="flex cursor-not-allowed items-center gap-2.5 rounded-lg px-3 py-2 text-sm font-medium text-zinc-400 dark:text-zinc-600"
-    >
-      {icone}
-      {rotulo}
-    </span>
   );
 }
 

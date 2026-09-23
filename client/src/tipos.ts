@@ -26,6 +26,10 @@ export interface Bloco {
   media_aprovacao: number | null;
   tabela_conteudos_construida: number;
   sugerir_testes_auto: number;
+  /** Fórmula da média escrita pelo usuário; null usa só a média ponderada. */
+  formula_media: string | null;
+  /** 1 = a média vem da fórmula; 0 = vem da ponderação por peso. */
+  usar_formula: number;
   ultimo_acesso: string | null;
   criado_em: string;
 }
@@ -73,6 +77,19 @@ export interface Mensagem {
   criado_em: string;
 }
 
+/** Uma fusão vista de um lado ou do outro. */
+export interface BlocoResumido {
+  id: string;
+  nome: string;
+}
+
+export interface Fusao {
+  /** Este bloco É fusão destas origens, quando é resultado de uma. */
+  resultado: { origens: BlocoResumido[] } | null;
+  /** Fusões das quais este bloco é uma das origens. */
+  comoOrigem: { resultado: BlocoResumido; outras: BlocoResumido[] }[];
+}
+
 export interface Relacao {
   id: string;
   bloco_origem_id: string;
@@ -115,7 +132,24 @@ export interface LinhaEditor {
 // ---------------------------------------------------------------------------
 // Modo Prova — listas de questões
 // ---------------------------------------------------------------------------
-export type OrigemLista = 'enviada' | 'gerada_fontes' | 'gerada_internet';
+/** 'gerada_geral': conhecimento geral, só com confirmação quando os documentos não tratam do tópico. */
+export type OrigemLista = 'enviada' | 'gerada_fontes' | 'gerada_internet' | 'gerada_geral';
+
+/** De qual trecho de documento uma questão gerada saiu. */
+export interface ApoioQuestao {
+  documento_id: string;
+  nome: string | null;
+  pagina_inicio: number | null;
+  pagina_fim: number | null;
+  titulo_secao: string | null;
+}
+
+/** Páginas de origem de uma lista, por documento. */
+export interface OrigemPaginas {
+  documento_id: string;
+  nome: string | null;
+  faixas: { de: number; ate: number }[];
+}
 export type StatusLista = 'nao_feita' | 'incompleta' | 'completa';
 /** 'prova' = listas do Modo Prova; 'projeto' = testes teóricos do Modo Projeto. */
 export type ContextoLista = 'prova' | 'projeto';
@@ -123,12 +157,20 @@ export type ContextoLista = 'prova' | 'projeto';
 export interface Questao {
   numero: number;
   enunciado: string;
+  /** Trecho em que a questão se apoia, quando veio de documentos. */
+  apoio?: ApoioQuestao;
 }
 
 export interface RespostaGabarito {
   numero: number;
   resposta: string;
 }
+
+/**
+ * De onde veio a estimativa de tempo. Só 'faixa' e 'exata' alimentam a
+ * calibração: a estimativa da IA mediria o erro do modelo, não o do usuário.
+ */
+export type OrigemEstimativa = 'llm' | 'faixa' | 'exata';
 
 export interface ListaQuestoes {
   id: string;
@@ -142,7 +184,14 @@ export interface ListaQuestoes {
   status: StatusLista;
   quantidade: number | null;
   contexto: ContextoLista;
+  data_prevista: string | null;
+  tempo_estimado_min: number | null;
+  origem_estimativa: OrigemEstimativa | null;
+  tipo_tarefa: string | null;
+  concluido_em: string | null;
   criado_em: string;
+  /** JSON de OrigemPaginas[]: de que páginas a lista gerada saiu. */
+  origem_paginas: string | null;
   topico_titulo: string | null;
   topico_peso: Peso | null;
 }
@@ -151,6 +200,11 @@ export interface RespostaLista {
   questoes: Questao[];
   gabarito: RespostaGabarito[];
   erro: string | null;
+  /** Nenhum trecho dos documentos trata do tópico: nada foi gerado. */
+  sem_relevancia?: boolean;
+  aviso?: string;
+  origem_paginas?: OrigemPaginas[] | null;
+  recuperacao?: { metodo: 'embeddings' | 'palavras'; trechos: ApoioQuestao[] };
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +225,8 @@ export interface Entregavel {
   data_entrega: string | null;
   ferramentas: string | null;
   tempo_estimado_horas: number | null;
+  origem_estimativa: OrigemEstimativa | null;
+  tipo_tarefa: string | null;
   concluido: number;
   concluido_em: string | null;
   criado_em: string;
@@ -188,7 +244,7 @@ export interface SugestaoEntregavel {
 }
 
 // ---------------------------------------------------------------------------
-// Wrapper acadêmico
+// Painel Acadêmico
 // A nota é um dado acadêmico informado pelo usuário — a plataforma nunca gera,
 // infere ou atribui nota.
 // ---------------------------------------------------------------------------
@@ -201,6 +257,15 @@ export interface Avaliacao {
   ordem: number;
   data: string | null;
   observacao: string | null;
+  data_prevista: string | null;
+  tempo_estimado_min: number | null;
+  origem_estimativa: OrigemEstimativa | null;
+  tipo_tarefa: string | null;
+  /** Marcada como feita pelo usuário. Independe de ter nota. */
+  feita: number;
+  /** A prova aconteceu; a nota pode não ter saído. A nota liga isto sozinha. */
+  realizada: number;
+  concluido_em: string | null;
   criado_em: string;
 }
 
@@ -210,6 +275,14 @@ export interface LinhaAvaliacao {
   titulo: string;
   peso: string;
   nota: string;
+  feita: boolean;
+  /** A prova foi feita e a nota ainda não saiu. */
+  realizada: boolean;
+  /** Opcionais: uma avaliação registrada só para a média funciona sem eles. */
+  data_prevista: string;
+  tempo_estimado_min: string;
+  origem_estimativa: OrigemEstimativa | null;
+  tipo_tarefa: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -231,4 +304,22 @@ export interface Compromisso {
   data: string;
   descricao: string;
   concluido: number;
+}
+
+// ---------------------------------------------------------------------------
+// Calendário
+// Uma prova de disciplina é a avaliação do bloco, nunca um evento à parte:
+// o mesmo objetivo de estudo jamais aparece duplicado.
+// ---------------------------------------------------------------------------
+export type TipoEvento = 'prova' | 'aula' | 'entrega' | 'outro';
+
+export interface Evento {
+  id: string;
+  bloco_id: string | null;
+  titulo: string;
+  tipo: TipoEvento | null;
+  data_inicio: string | null;
+  data_fim: string | null;
+  observacao: string | null;
+  criado_em: string;
 }

@@ -11,6 +11,8 @@
     "moduleDetection": "force",
     "noEmit": true,
     "jsx": "react-jsx",
+    /* lib/grafo.js é JavaScript de propósito: o servidor importa o mesmo arquivo. */
+    "allowJs": true,
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,

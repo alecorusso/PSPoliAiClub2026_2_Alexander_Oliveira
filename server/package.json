@@ -12,7 +12,10 @@
     "better-sqlite3": "^12.2.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
-    "express": "^4.21.2"
+    "express": "^4.21.2",
+    "mammoth": "^1.12.3",
+    "multer": "^2.4.0",
+    "pdfjs-dist": "^4.10.38"
   },
   "allowScripts": {
     "better-sqlite3": true

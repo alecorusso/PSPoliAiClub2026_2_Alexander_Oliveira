@@ -6,3 +6,10 @@ dist/
 *.db-wal
 *.db-shm
 .DS_Store
+
+# Atalho do Windows: guarda caminhos absolutos desta maquina.
+# Recrie com "Criar atalho.bat".
+*.lnk
+
+# Arquivos originais dos documentos enviados pelo usuario.
+server/arquivos/

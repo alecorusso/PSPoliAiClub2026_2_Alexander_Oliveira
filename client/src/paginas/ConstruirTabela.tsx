@@ -1,10 +1,10 @@
-import { useRef, useState } from 'react';
-import { api } from '../api';
+import { useState } from 'react';
+import { api, apiDocumentos } from '../api';
 import type { Bloco, LinhaEditor } from '../tipos';
 import { linhasParaPayload, novoId, sugestoesParaLinhas } from '../util';
 import { EditorTabelaConteudos } from '../componentes/EditorTabelaConteudos';
 import { Aviso, Carregando, IconeBussola, IconeLista, IconeUpload } from '../componentes/ui';
-import { EXTENSOES_ACEITAS, extrairTexto } from '../extrairTexto';
+import { SeletorDocumentos } from '../componentes/SeletorDocumentos';
 
 type Etapa = 'escolha' | 'revisao';
 type Origem = 'documentos' | 'manual' | 'roteiro';
@@ -22,8 +22,8 @@ export function ConstruirTabela({ bloco, aoConcluir }: { bloco: Bloco; aoConclui
   const [ocupado, setOcupado] = useState<string | null>(null);
   const [erro, setErro] = useState<string | null>(null);
   const [tema, setTema] = useState('');
-  const [arquivos, setArquivos] = useState<File[]>([]);
-  const entradaArquivo = useRef<HTMLInputElement>(null);
+  // Os documentos vêm do repositório do bloco, que já deduplica.
+  const [documentosIds, setDocumentosIds] = useState<string[]>([]);
 
   const irParaRevisao = (novas: LinhaEditor[], deOnde: Origem, mensagemErro: string | null) => {
     setLinhas(novas);
@@ -32,24 +32,18 @@ export function ConstruirTabela({ bloco, aoConcluir }: { bloco: Bloco; aoConclui
     setEtapa('revisao');
   };
 
-  // Opção 1 — documentos: extrai o texto, salva em documentos_fonte e chama a IA.
-  const enviarDocumentos = async () => {
-    if (arquivos.length === 0) return;
+  // Opção 1 — documentos do repositório do bloco.
+  const gerarDosDocumentos = async () => {
+    if (documentosIds.length === 0) return;
     setErro(null);
-    setOcupado('Lendo os documentos…');
+    setOcupado('Gerando a árvore de tópicos…');
     try {
-      const documentos = [];
-      for (const arquivo of arquivos) {
-        const texto = await extrairTexto(arquivo);
-        documentos.push({ nome_arquivo: arquivo.name, conteudo_texto: texto });
-      }
-      await api.enviarDocumentos(bloco.id, documentos);
-
-      setOcupado('Gerando a árvore de tópicos…');
-      const r = await api.extrairTabela(bloco.id);
+      const r = await api.extrairTabela(bloco.id, documentosIds);
+      // Fica registrado de quais documentos a tabela saiu.
+      await apiDocumentos.registrarUso(documentosIds, 'tabela_conteudos', bloco.id);
       irParaRevisao(sugestoesParaLinhas(r.topicos), 'documentos', r.erro);
     } catch (e) {
-      // Falha da IA (ou da leitura) nunca bloqueia: cai na tela de revisão vazia.
+      // Falha da IA nunca bloqueia: cai na tela de revisão vazia.
       irParaRevisao([], 'documentos', (e as Error).message);
     } finally {
       setOcupado(null);
@@ -168,30 +162,16 @@ export function ConstruirTabela({ bloco, aoConcluir }: { bloco: Bloco; aoConclui
             Os melhores documentos são a ementa da disciplina, a literatura ou apostila de
             referência, e outros materiais sobre o assunto.
           </p>
-          <input
-            ref={entradaArquivo}
-            type="file"
-            multiple
-            accept={EXTENSOES_ACEITAS}
-            className="hidden"
-            onChange={(e) => setArquivos(Array.from(e.target.files ?? []))}
+          <SeletorDocumentos
+            blocoId={bloco.id}
+            fluxo="tabela_conteudos"
+            selecionados={documentosIds}
+            aoMudarSelecao={setDocumentosIds}
           />
-          <button className="btn-secundario w-full" onClick={() => entradaArquivo.current?.click()}>
-            Escolher arquivos (.txt, .md, .pdf)
-          </button>
-          {arquivos.length > 0 && (
-            <ul className="space-y-0.5 text-xs text-zinc-500 dark:text-zinc-400">
-              {arquivos.map((a) => (
-                <li key={a.name} className="truncate">
-                  {a.name}
-                </li>
-              ))}
-            </ul>
-          )}
           <button
             className="btn-primario w-full"
-            onClick={() => void enviarDocumentos()}
-            disabled={arquivos.length === 0 || Boolean(ocupado)}
+            onClick={() => void gerarDosDocumentos()}
+            disabled={documentosIds.length === 0 || Boolean(ocupado)}
           >
             Gerar a partir dos documentos
           </button>

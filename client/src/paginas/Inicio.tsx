@@ -5,6 +5,7 @@ import type { Bloco, Revisao } from '../tipos';
 import { useSondagem } from '../estado/sondagem';
 import { diasRelativos, formatarData } from '../util';
 import { CardCompromissos } from '../componentes/CardCompromissos';
+import { CardSugestoes } from '../componentes/CardSugestoes';
 import {
   Carregando,
   Etiqueta,
@@ -40,6 +41,8 @@ export function PaginaInicio() {
   return (
     <div className="mx-auto max-w-4xl space-y-8 px-6 py-6">
       <h1 className="text-xl font-semibold">Início</h1>
+
+      <CardSugestoes />
 
       <CardCompromissos />
 
